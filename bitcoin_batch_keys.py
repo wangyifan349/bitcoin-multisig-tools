@@ -1247,7 +1247,7 @@ def build_parser():
     """Build the argparse parser."""
     parser = argparse.ArgumentParser(
         prog="bitcoin_batch_keys.py",
-        description="Bitcoin private key (WIF)/address batch tool; run it directly without parameters (or double-click) to enter the interactive menu",
+        description="Bitcoin private key (WIF)/address batch tool. Run it with no arguments (or double-click) to enter the interactive menu.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Example:\n"
                "Double-click this file, or run it directly to enter the interactive menu\n"
@@ -1282,7 +1282,7 @@ def build_parser():
     info.add_argument("--strict", action="store_true", help="Returns a non-zero exit code when there is an unresolvable address")
     info.set_defaults(func=command_info)
 
-    test = subs.add_parser("selftest", help="self-test")
+    test = subs.add_parser("selftest", help="Run the built-in self-test")
     test.add_argument("-v", "--verbose", action="store_true", help="Item-by-item print inspection process")
     test.set_defaults(func=command_selftest)
     return parser

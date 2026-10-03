@@ -1,37 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =================================================================
-# Bitcoin Multisig Address Generation and Verification Tool——V2
+# Bitcoin Multisig Address Generation and Verification Tool — V2
 #
-# Double-click this file (or run it without parameters) to enter the interactive menu; the command line can also be used directly.
+# Double-click this file (or run it without arguments) to open the interactive menu;
+# the CLI subcommands work from the command line too.
 #
-# Two types of multi-signatures are supported. The two mechanisms are different, so do not mix them:
+# Two multisig mechanisms are supported. They are different, so do not mix them:
 #
-#1) Native SegWit multi-signature (P2WSH) starting with bc1q, m-of-n
-# Script OP_m <public key 1> ... <public key n> OP_n OP_CHECKMULTISIG
-# Address bech32(witness v0, hash160(witnessScript))
-# Features: Any m members can sign to spend; members can be added or removed without changing the address structure.
-# But if you change the member set, you must change the address.
+# 1) Native SegWit multisig (P2WSH), addresses start with bc1q, m-of-n
+#    Script: OP_m <pubkey 1> ... <pubkey n> OP_n OP_CHECKMULTISIG
+#    Address: bech32(witness v0, hash160(witnessScript))
+#    Properties: any m members can sign to spend; changing the member set changes the address.
 #
-#2) Taproot multi-signature starting with bc1p (P2TR script path), N-of-N full signature
-# One tapscript leaf per member: <32-byte x-coordinate> OP_CHECKSIG
-# The leaves form TapTree to obtain the merkle root, and then tweak the NUMS internal public key.
-# Address bech32m(witness v1, output_key)
-# Features: All members must sign, no one is missing. Taproot does not have OP_CHECKMULTISIG,
-# Can't do m-of-n in a script; common implementation requires MuSig2 key aggregation
-#(That's another solution), or use script path + full signature like this file.
-# Security The internal public key is fixed using the NUMS point of BIP341, and no one knows its discrete logarithm,
-# Therefore, the key path cannot be spent, and the money can only be moved by the signature of all members of the script path.
-# The base point G must not be used here as the internal public key - the discrete logarithm of G is 1, anyone can
-# Calculating the tweak to private key yourself is equivalent to bypassing multi-signature.
+# 2) Taproot multisig, addresses start with bc1p (P2TR script path), N-of-N full signing
+#    One tapscript leaf per member: <32-byte x-only pubkey> OP_CHECKSIG
+#    The leaves form a TapTree to get the merkle root, which tweaks the NUMS internal key.
+#    Address: bech32m(witness v1, output_key)
+#    Properties: all members must sign; none may be missing. Taproot has no OP_CHECKMULTISIG,
+#    so m-of-n is impossible in script; the common alternative is MuSig2 key aggregation,
+#    or the script-path + full-signing approach used by this file.
+#    Security: the internal key is the BIP341 NUMS point, whose discrete log is unknown,
+#    so the key path cannot be spent; funds can move only via the script path with every
+#    member signing. The internal key must NOT be the base point G — G's discrete log is 1,
+#    so anyone could compute the tweaked private key and bypass the multisig entirely.
 #
-# Member input: WIF private key / 64-bit hexadecimal private key / decimal private key /
-#33-byte compressed public key / 65-byte uncompressed public key / 32-byte x-only public key (Taproot only)
+# Member input: WIF private key / 64-hex private key / decimal private key /
+# 33-byte compressed pubkey / 65-byte uncompressed pubkey / 32-byte x-only pubkey (Taproot only)
 #
 # -----------------------------------------------------------------
-# Implementation instructions: Prioritize using the installed library (coincurve/ecdsa/bech32m/bech32/base58),
-# Whichever one is not installed will automatically return to the equivalent implementation built into this file, and it can be run even if a single file is copied.
-# It does not rely on any wallet-level or third-party multi-signature encapsulation, and the signature hash is all implemented by itself according to BIP specifications.
+# Implementation notes: prefer installed libraries (coincurve/ecdsa/bech32m/bech32/base58);
+# any that are missing fall back to the equivalent built-in implementations in this file,
+# so a single copied file still runs. No wallet-level or third-party multisig wrapper is used;
+# signature hashes are implemented directly from the BIP specifications.
 # =================================================================
 import argparse
 import hashlib
@@ -42,18 +43,18 @@ import secrets
 import sys
 import time
 
-if os.name == "nt":                               # Console encoding adjustment is only required on Windows
+if os.name == "nt":                               # Console encoding fix is only needed on Windows
     import ctypes
 else:
     ctypes = None
 #================= Optional encoding library: base58 =================
-try:                                             # Prefer using pip install base58
+try:                                             # Prefer: pip install base58
     import base58
     HAVE_BASE58 = True
-except ImportError:                              # Fallback to built-in implementation when missing
+except ImportError:                              # Fall back to the built-in implementation
     HAVE_BASE58 = False
 
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"  # Remove the easily mixed 0 O I l
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"  # Omits easily confused characters 0 O I l
 
 
 def b58_encode_builtin(data):
@@ -1132,7 +1133,7 @@ Because even with ANYONECANPAY, Taproot hashes all of this information entered t
         if input_index >= len(tx.outputs):
             raise ValueError("SIGHASH_SINGLE When the input sequence number exceeds the output quantity")
         message += sha256(tx.outputs[input_index].serialize())
-    # BIP342 script path expansion: if script is given, it must be connected
+    # BIP342 script-path extension: if script is given, it must be connected
     # tapleaf_hash(32) || key_version(1) || codesep_pos(4, little endian).
     # Note that codesep_pos is **fixed 4 bytes** and will be written as 0xffffffff when OP_CODESEPARATOR has not been executed.
     # Not omitted - leaving out those 37 bytes would result in a completely different hash.
@@ -1343,7 +1344,7 @@ Returns (derived public key, root xpub, derived xpub).
             raise ValueError("The derived path must be hard-coded here, wildcards cannot be used.")
         key = derive_pubkey(key, int(item))
     return key.pubkey, root_xpub, serialize_extended_key(key, version)
-#================= Script executor (really run the script during self-test) =================
+#================= Script executor (really run the script during Self-test) =================
 OP_0 = 0x00
 OP_PUSHDATA1 = 0x4C
 OP_PUSHDATA2 = 0x4D
@@ -1506,7 +1507,7 @@ def execute_tapscript(script, stack, verify_signature):
     return len(stack) == 1 and bool(stack[0])
 
 
-#================= Built-in ECDSA signature (for self-test only) =================
+#================= Built-in ECDSA signature (for Self-test only) =================
 def encode_der_signature(r, s):
     """Encode (r, s) as DER: 30 <len> 02 <len> r 02 <len> s."""
     def part(value):
@@ -1519,7 +1520,7 @@ def encode_der_signature(r, s):
 
 
 def ecdsa_sign(message_hash, secret):
-    """Built-in ECDSA signature, dedicated for self-test (please use a mature wallet or HWI for production environment)."""
+    """Built-in ECDSA signature, dedicated for Self-test (please use a mature wallet or HWI for production environment)."""
     value = int.from_bytes(message_hash, "big") % ORDER
     while True:
         nonce = secrets.randbelow(ORDER - 1) + 1
@@ -1926,7 +1927,7 @@ In addition, the decoding end must be able to identify the version and witness p
         # Addresses with incorrect length must also be rejected
         if segwit_decode(good[:40]) is not None:
             raise AssertionError("The truncated address can still be solved")
-        return "The encoding side version is bound correctly, and the decoding side can restore and reject bad checksums."
+        return "The encoder binds the version correctly; the decoder rejects malformed checksums."
 
     def tagged_hash_domain():
         expect_equal("tagged_hash with field separation",
@@ -1949,7 +1950,7 @@ In addition, the decoding end must be able to identify the version and witness p
         wrong_key = pubkey_to_xonly(compressed_pubkey(secret + 1))
         if schnorr_verify(message, wrong_key, signature):
             raise AssertionError("I can still get through changing the public key")
-        return "Signature verification passed; tampering and key replacement were rejected."
+        return "Signing and verification pass; tampered signatures and wrong keys are rejected."
 
     def bip340_vectors():
         """Check the BIP340 official vector: if it can be signed, re-sign and compare it one by one, and if it can only be signed, it will be judged one by one to pass/reject."""
@@ -1972,7 +1973,7 @@ In addition, the decoding end must be able to identify the version and witness p
             produced = schnorr_sign(message, secret, bytes.fromhex(aux_hex))
             expect_equal("%s signature" % label, produced.hex(), sig_hex)
             signed += 1
-        return "Re-sign %d items + Verify %d items are all consistent with the official" % (signed, verified)
+        return "Re-signed %d cases and verified %d; all match the official vectors." % (signed, verified)
 
     def ecdsa_roundtrip():
         secret = 0x0BADC0DE00000000000000000000000000000000000000000000000000000001
@@ -1985,7 +1986,7 @@ In addition, the decoding end must be able to identify the version and witness p
             raise AssertionError("I can still get through changing the public key")
         if ecdsa_verify(sha256(b"another message"), signature, pubkey):
             raise AssertionError("I can still survive by changing the news")
-        return "Signature verification passed; key exchange and message exchange were rejected."
+        return "Signing and verification pass; wrong keys and changed messages are rejected."
 
     def bip32_fields():
         # Mainnet xpub of BIP32 official vector 1, field-by-field verification
@@ -2001,7 +2002,7 @@ In addition, the decoding end must be able to identify the version and witness p
         expect_equal("xpub public key", key.pubkey.hex(),
                      "0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2")
         expect_equal("xpub round trip consistent", serialize_extended_key(key, version), text)
-        return "Fields and round trips are consistent with the official vector"
+        return "All fields and round-trips match the official vectors."
 
     def bip32_derives():
         # Only non-reinforced derivation is supported, so the mainnet xpub of the official vector 1 is used as the parent.
@@ -2034,7 +2035,7 @@ In addition, the decoding end must be able to identify the version and witness p
             raise AssertionError("Derive an illegal public key")
         if serialize_extended_key(child, version).startswith("xpub") is False:
             raise AssertionError("Wrong prefix after recoding")
-        return "Byte-by-byte consistent with libsecp256k1, parity flipping is also correct"
+        return "Byte-for-byte consistent with libsecp256k1, including parity flips."
 
     def bip32_hardened_rejected():
         _, key = parse_extended_key(
@@ -2043,7 +2044,7 @@ In addition, the decoding end must be able to identify the version and witness p
         try:
             derive_pubkey(key, 0x80000000)
         except ValueError:
-            return "The hardening path is correctly rejected (xpub does not have a private key and cannot be exported)"
+            return "Hardened derivations are rejected (xpubs contain public keys only)."
         raise AssertionError("The hardening path was not rejected")
 
     def descriptor_checksum_vector():
@@ -2068,20 +2069,20 @@ In addition, the decoding end must be able to identify the version and witness p
         uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" \
                        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
         expect_equal("Uncompressed public keys are valid", is_valid_pubkey(bytes.fromhex(uncompressed)), True)
-        return "Valid/invalid are all correct"
+        return "Valid and invalid keys are classified correctly."
 
     check("BIP173 bech32 address", bech32_p2wpkh)
     check("BIP350 bech32m address", bech32m_p2tr)
-    check("The witness version is bound to the checksum", bech32_version_binding)
+    check("Witness version and checksum are bound", bech32_version_binding)
     check("tagged_hash domain separation", tagged_hash_domain)
     check("Schnorr signature verification", schnorr_roundtrip)
-    check("BIP340 official vector", bip340_vectors)
-    check("ECDSA signature verification", ecdsa_roundtrip)
+    check("BIP340 test vectors", bip340_vectors)
+    check("ECDSA signing and verification", ecdsa_roundtrip)
     check("BIP32 xpub field", bip32_fields)
-    check("BIP32 non-ruggedized derivative", bip32_derives)
-    check("Reinforcement path rejected", bip32_hardened_rejected)
+    check("BIP32 non-hardened derivation", bip32_derives)
+    check("Hardened derivations are rejected", bip32_hardened_rejected)
     check("BIP380 descriptor checksum", descriptor_checksum_vector)
-    check("Public key validity judgment", pubkey_validation)
+    check("Public key validity", pubkey_validation)
 
 
 #---------- Official vector (BIP341 TapTree) ----------
@@ -2199,13 +2200,13 @@ def register_vector_checks(check):
         script = bytes.fromhex("20" + "11" * 32 + "ac")
         expect_equal("TapLeaf hash", tapleaf_hash(script),
                      tagged_hash("TapLeaf", b"\xc0" + b"\x22" + script))
-        return "Consistent with BIP341 definition byte by byte"
+        return "Matches the BIP341 definition byte for byte."
 
     def tapbranch_is_order_independent():
         first, second = sha256(b"a"), sha256(b"b")
         expect_equal("Branch hashing is order independent", tapbranch_hash(first, second),
                      tapbranch_hash(second, first))
-        return "The result is the same if the order is reversed"
+        return "Result is identical regardless of leaf order."
 
     def taptree_convention():
         # The tree shape of the three leaves in the official vector is [l0, [l1, l2]], and the floor segmentation of this tool must be reproducible.
@@ -2218,7 +2219,7 @@ def register_vector_checks(check):
         expect_equal("3 leaf tree shape", root.hex(), manual.hex())
         expect_equal("The number of side branches of leaf 0", len(paths[0]), 1)
         expect_equal("The number of side branches of leaf 1", len(paths[1]), 2)
-        return "[l0,[l1,l2]], the same shape as the official vector"
+        return "[l0,[l1,l2]], same shape as the official vectors."
 
     def wallet_vectors():
         """Check the embedded BIP341 official vectors item by item."""
@@ -2269,14 +2270,14 @@ def register_vector_checks(check):
             expect_equal("Official vector bech32m address", segwit_encode("bc", 1, program),
                          entry["addr"])
             counts["address"] += 1
-        return "Leaf %d Root %d tweak%d Output %d Control block %d Script %d Address %d All correct" % (
+        return "%d leaves, %d roots, %d tweaks, %d outputs, %d control blocks, %d scripts, %d addresses - all matched." % (
             counts["leaf"], counts["root"], counts["tweak"], counts["output"],
             counts["control"], counts["spk"], counts["address"])
 
     check("TapLeaf hash algorithm", tapleaf_hash_matches_spec)
-    check("TapBranch order independent", tapbranch_is_order_independent)
-    check("TapTree segmentation convention", taptree_convention)
-    check("BIP341 official vector", wallet_vectors)
+    check("TapBranch order-independence", tapbranch_is_order_independent)
+    check("TapTree branch layout", taptree_convention)
+    check("BIP341 test vectors", wallet_vectors)
 
 
 #----------Multi-signature plan ----------
@@ -2303,7 +2304,7 @@ def register_multisig_checks(check):
             raise AssertionError("2 signatures that should have passed but didn't")
         if verify_p2wsh_multisig(scheme["witness_script"], ordered, secrets_by_key, 3)[0]:
             raise AssertionError("3 signatures were rejected by 2-of-3")
-        return "2-of-3: 1 signature rejected, 2 approved, multiple signatures do not exceed authority"
+        return "2-of-3: 1 signature is rejected, 2 pass, and extra signatures are rejected."
 
     def three_of_five():
         members = random_members(5)
@@ -2315,7 +2316,7 @@ def register_multisig_checks(check):
         if not verify_p2wsh_multisig(scheme["witness_script"], scheme["keys"],
                                      secrets_by_key, 3)[0]:
             raise AssertionError("3-of-5 should pass")
-        return "3-of-5: 2 rejected, 3 passed"
+        return "3-of-5: 2 signatures are rejected, 3 pass."
 
     def wrong_signer_rejected():
         # Three people are on the list, but signing with a private key outside the list should not pass.
@@ -2331,7 +2332,7 @@ def register_multisig_checks(check):
             lambda sig, pk: ecdsa_verify(message, sig, pk))
         if ok:
             raise AssertionError("People who were not on the list actually signed successfully.")
-        return "Signatures from members outside the list were rejected"
+        return "Signatures from non-member keys are rejected."
 
     def sorting_matters():
         # There is about a 1/6 probability that \"byte ascending order\" and \"fingerprint order\" under a random public key are exactly the same.
@@ -2351,7 +2352,7 @@ def register_multisig_checks(check):
             raise AssertionError("The two sortings give the same address, but the sorting does not take effect.")
         if by67["witness_script"] == byfinger["witness_script"]:
             raise AssertionError("Two sortings give the same witnessScript, but the sorting does not take effect.")
-        return "Sorting does affect addresses (BIP67 byte ascending)"
+        return "Ordering changes the address (BIP67 lexicographic order)."
 
     def taproot_all_sign():
         # Run a few more rounds: the y parity bits of the output public key are approximately random. If you run only one round, there is about half a probability of not touching a certain side.
@@ -2371,7 +2372,7 @@ def register_multisig_checks(check):
                 raise AssertionError("There is no use case that has been signed by all employees.")
             if not any((not expect) and (not actual) for _l, expect, actual, _d in rows):
                 raise AssertionError("There is no use case where one person signed less and was rejected.")
-        return "bc1p: Even after running %d rounds, 3 signatures were passed and 2 signatures were rejected." % rounds
+        return "bc1p: over %d trials, the required signature count passes and fewer signers fail." % rounds
 
     def taproot_internal_key_matters():
         members = random_members(2)
@@ -2381,7 +2382,7 @@ def register_multisig_checks(check):
         if taproot_output_key(BASE_X.to_bytes(32, "big"),
                               scheme["merkle_root"]) == scheme["output_key"]:
             raise AssertionError("The output public key is not affected by the internal public key")
-        return "The output public key depends on the internal public key, and the internal public key is NUMS not G"
+        return "The output key depends on the internal key, which is the NUMS key rather than the generator."
 
     def taproot_tree_layout_differs():
         members = random_members(3)
@@ -2391,7 +2392,7 @@ def register_multisig_checks(check):
             raise AssertionError("The chain and tree layouts have the same address")
         if chain["signature_count"] != tree["signature_count"]:
             raise AssertionError("The number of signatures should be the same for both layouts")
-        return "chain and tree are two different addresses"
+        return '"chain" and "tree" produce two different addresses.'
 
     def address_prefixes():
         members = random_members(3)
@@ -2418,7 +2419,7 @@ def register_multisig_checks(check):
                 raise AssertionError("A non-mainnet address popped up:" + address)
         if not produced[0].startswith("bc1q") or not produced[-1].startswith("bc1p"):
             raise AssertionError("Mainnet prefix is wrong")
-        return "%d addresses are all mainnet, there is no tb1/bcrt1" % len(produced)
+        return "%d addresses are mainnet only; no tb1/bcrt1." % len(produced)
 
     def member_input_forms():
         secret = 0x2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A
@@ -2431,7 +2432,7 @@ def register_multisig_checks(check):
             seen.add(parse_member(form)["pubkey"])
         if len(seen) != 1:
             raise AssertionError("The five ways of writing the same private key parsed out %d different public keys." % len(seen))
-        return "WIF/hex/decimal/public key/x-only, the five writing methods have the same result."
+        return "WIF / hex / decimal / compressed pubkey / x-only forms all yield the same result."
 
     def inspect_addresses():
         members = random_members(3)
@@ -2452,20 +2453,20 @@ def register_multisig_checks(check):
             report = inspect_address(junk)
             if "Can't understand" not in report:
                 raise AssertionError("The garbage input %r was parsed successfully: %s" % (junk, report.strip()))
-        return "bc1q / bc1p / P2SH can all be parsed, and garbage input only prompts without crashing."
+        return "bc1q / bc1p / P2SH parse correctly, and malformed input is reported without crashing."
 
-    check("witnessScript structure", witness_script_structure)
-    check("2-of-3 threshold takes effect", threshold_enforced)
-    check("3-of-5 threshold takes effect", three_of_five)
-    check("Members outside the list are rejected", wrong_signer_rejected)
-    check("Public key ordering affects addresses", sorting_matters)
-    check("Signed by all bc1p members", taproot_all_sign)
-    check("Taproot internal public key", taproot_internal_key_matters)
-    check("Taproot two layouts", taproot_tree_layout_differs)
-    check("address prefix", address_prefixes)
-    check("Only mainnet address", mainnet_only)
-    check("Member input format", member_input_forms)
-    check("Geocoding inspect", inspect_addresses)
+    check("Witness script structure", witness_script_structure)
+    check("2-of-3 threshold enforced", threshold_enforced)
+    check("3-of-5 threshold enforced", three_of_five)
+    check("Signatures from non-member keys are rejected", wrong_signer_rejected)
+    check("Public key ordering changes the address", sorting_matters)
+    check("bc1p requires all signers", taproot_all_sign)
+    check("Taproot internal key", taproot_internal_key_matters)
+    check("Taproot chain vs tree", taproot_tree_layout_differs)
+    check("Address prefixes", address_prefixes)
+    check("Mainnet-only addresses", mainnet_only)
+    check("Member input formats", member_input_forms)
+    check("Address inspection", inspect_addresses)
 
 
 #---------- Official vector (BIP143 native SegWit signature hash) ----------
@@ -2626,7 +2627,7 @@ def register_official_sighash_checks(check):
                 expect_equal("BIP143 %s hashType=%s" % (case["name"], key),
                              got.hex(), expected)
                 passed += 1
-        return "%d official vectors are all consistent (including 6 hash types)" % passed
+        return "All %d official vectors match (across hash types)." % passed
 
     def taproot_sighash_official():
         vector = TAPROOT_SIGHASH_VECTOR
@@ -2662,7 +2663,7 @@ def register_official_sighash_checks(check):
                 raise AssertionError("Official Schnorr signature failed signature verification under derived output public key: enter %d"
                                      % index)
             passed += 1
-        return "%d official vectors are all consistent (including tweak/output public key/Schnorr signature verification)" % passed
+        return "All %d vectors match (tweak, output key, Schnorr verification included)." % passed
 
     def bip342_script_path_extension():
         """The BIP342 script path extension must follow the BIP341 generic SigMsg.
@@ -2708,7 +2709,7 @@ Everything works fine with the 37 bytes less key path, only the script path comp
         extension += (0xFFFFFFFF).to_bytes(4, "little")  # Not executed OP_CODESEPARATOR
         script_path = taproot_sighash(tx, 0, prevout_scripts, amounts, 0x00,
                                       ext_flag=1, script=leaf_script)
-        expect_equal("BIP342 script path expansion", script_path.hex(),
+        expect_equal("BIP342 script-path extension", script_path.hex(),
                      tagged_hash("TapSighash", b"\x00" + common
                                  + bytes([0x02]) + index_bytes + extension).hex())
 
@@ -2731,11 +2732,11 @@ Everything works fine with the 37 bytes less key path, only the script path comp
         signature = schnorr_sign(script_path, secret)
         if not schnorr_verify(script_path, xonly, signature):
             raise AssertionError("Script path signature self-verification failed")
-        return "key path / script path / codesep_pos All three are correct, extending 37 bytes"
+        return "Key path, script path, and codesep_pos all correct; the extension is 37 bytes."
 
-    check("BIP143 official signature hash", bip143_official)
-    check("BIP341 official signature hash", taproot_sighash_official)
-    check("BIP342 script path expansion", bip342_script_path_extension)
+    check("BIP143 official signature hashes", bip143_official)
+    check("BIP341 official signature hashes", taproot_sighash_official)
+    check("BIP342 script-path extension", bip342_script_path_extension)
 
 #================= Output format =================
 def cell(value):
@@ -3039,11 +3040,11 @@ def command_inspect(args):
 
 
 def command_selftest(args):
-    """Built-in self-test. By default, only one line of conclusions is reported, and -v is used to list each item."""
+    """Built-in Self-test. By default, only one line of conclusions is reported, and -v is used to list each item."""
     checks = []
     register_checks(lambda name, function: collect_check(checks, name, function))
     if args.verbose:
-        write_output(render_selftest_report("self-test", checks), args.out)
+        write_output(render_selftest_report("Self-test", checks), args.out)
         return 0 if all(item[1] for item in checks) else 1
     failed = [item for item in checks if not item[1]]
     write_output("Total %d checks, %d failed." % (len(checks), len(failed)) if failed
@@ -3052,7 +3053,7 @@ def command_selftest(args):
 
 
 def collect_check(checks, name, function):
-    """Run a self-test and note any abnormalities as results."""
+    """Run a Self-test and note any abnormalities as results."""
     try:
         checks.append((name, True, function() or ""))
     except Exception as error:                    # Self-test should count any exception as a failure
@@ -3061,22 +3062,23 @@ def collect_check(checks, name, function):
 
 MENU_TEXT = """
 ================== Bitcoin Multi-signature Tool V2 ==================
-1 Generate a multi-signature solution with one click. The program creates a private key and gives you the address directly.
-2 Use your own list to generate and paste xpub / public key / private key
-3 Parse address
-4 self-test
-0 exit
+1 One-click multisig plan
+     (the program creates the keys for you)
+2 Use your own member list  Paste xpub / public keys / private keys
+3 Inspect address
+4 Self-test
+0 Exit
 ======================================================
 """.strip("\n")
 
-WARNING_TEXT = "The private key will be saved in this file. Do not send it online or put it in the code repository."
+WARNING_TEXT = "The keys above are confidential. Keep any private keys offline and out of source control.tory."
 
 
 def prompt_members():
-    """Paste members. One per line, you can also separate them with commas and post them all at once; press Enter to end."""
-    print("Can be mixed: WIF private key / 64-bit hexadecimal private key / decimal private key")
+    """Paste the member list.ter to end."""
+    print("WIF private key / 64-bit hex private key / decimal private key are all accepted.")
     print("33-byte compressed public key / x: plus 64-bit x-only public key / xpub derivation path")
-    print("One per line, or comma-separated; press Enter to finish:")
+    print("One per line, or comma-separated; press Enter on an empty line to finish:")
     lines = []
     while True:
         try:
@@ -3093,24 +3095,24 @@ def ask_threshold(members):
     """bc1q requires several signatures. Just ask this sentence, press Enter to use the default value; if you make a mistake, ask again without reporting an error."""
     fallback = default_threshold(len(members))
     while True:
-        raw = input("bc1q requires several signatures (1-%d, press Enter to default to %d):" % (
+        raw = input("Signatures required for bc1q (1-%d, press Enter for %d):" % (
             len(members), fallback)).strip()
         if not raw:
             return fallback
         try:
             value = int(raw)
         except ValueError:
-            print("Please enter an integer between 1-%d." % len(members))
+            print("Enter an integer between 1 and %d." % len(members))
             continue
         if 1 <= value <= len(members):
             return value
-        print("Number of signers must be between 1-%d; you have %d members." % (len(members), len(members)))
+        print("The threshold must be between 1 and %d; this plan has %d members." % (len(members), len(members)))
 
 
 def show_schemes(members, threshold):
-    """bc1q and bc1p are released together. I checked the private keys and finally asked if I want to save the file."""
-    pairs = [("bc1q can be signed by any m people", build_p2wsh_scheme(members, threshold)),
-             ("Signed by all members of bc1p, no one should be missing", build_taproot_scheme(members))]
+    """Show both bc1q and bc1p plans. If all keys exist locally, verify signatures before asking to save. file."""
+    pairs = [("bc1q lets any m-of-n signers spend", build_p2wsh_scheme(members, threshold)),
+             ("bc1p requires every member to sign", build_taproot_scheme(members))]
     blocks = []
     for title, scheme in pairs:
         text = render_scheme(scheme)
@@ -3183,7 +3185,7 @@ def menu_selftest():
     checks = []
     register_checks(lambda name, function: collect_check(checks, name, function))
     print()
-    print(render_selftest_report("self-test", checks))
+    print(render_selftest_report("Self-test", checks))
     failed = [item for item in checks if not item[1]]
     print()
     print("Total %d checks, %d failed." % (len(checks), len(failed)) if failed
@@ -3204,11 +3206,11 @@ def show_menu():
 def run_interactive():
     enable_utf8_console()
     print()
-    print("Bitcoin multi-signature address tool V2 (mainnet only)")
+    print("Bitcoin multisig address tool V2 (mainnet only)")
     print("  " + "-" * 46)
-    print("bc1q = m-of-n, any m people can sign")
-    print("bc1p = all members must sign; none of the N may be missing")
-    print("These two mechanisms are different, so don't mix them.")
+    print("bc1q = m-of-n: any m signatures are enough")
+    print("bc1p = n-of-n: every member must sign")
+    print("These mechanisms are different; do not confuse them.")
     while True:
         show_menu()
         try:
@@ -3241,7 +3243,7 @@ def add_common_arguments(parser):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="bitcoin_multisig_v2",
-        description="Bitcoin multi-signature address generation and signature verification (mainnet): bc1q's m-of-n, bc1p's full signature")
+        description="Bitcoin multisig address generation and verification (mainnet): bc1q m-of-n, bc1p n-of-n")
     subparsers = parser.add_subparsers(dest="command")
 
     build = subparsers.add_parser("build", help="Generate multi-signature plan based on member list")
@@ -3257,15 +3259,15 @@ def build_parser():
     build.add_argument("--verify", action="store_true", help="By the way, do end-to-end signature verification")
     add_common_arguments(build)
 
-    keys = subparsers.add_parser("keys", help="Randomly generate member keys")
+    keys = subparsers.add_parser("keys", help="Generate random member keys")
     keys.add_argument("-c", "--count", type=int, default=10, help="Generate several, default 10")
     add_common_arguments(keys)
 
-    inspect = subparsers.add_parser("inspect", help="resolve address")
+    inspect = subparsers.add_parser("inspect", help="Inspect address")
     inspect.add_argument("address", help="The address to resolve")
     add_common_arguments(inspect)
 
-    selftest = subparsers.add_parser("selftest", help="Built-in self-test")
+    selftest = subparsers.add_parser("selftest", help="Built-in Self-test")
     selftest.add_argument("-o", "--out", default="-", help="Output file, - means print to screen")
     selftest.add_argument("-v", "--verbose", action="store_true", help="Show results item by item")
     return parser
