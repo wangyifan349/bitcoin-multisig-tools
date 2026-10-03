@@ -1,143 +1,145 @@
 # ₿ Bitcoin Key & Multisig Tools
 
-> 两个**单文件、零依赖运行、中文友好**的比特币命令行工具 🔑🏗️ —— 保护私钥、正确建多签、方便自测。
+> Two **single-file, zero-dependency-friendly, Chinese-friendly** Bitcoin command-line tools 🔑🏗️ — keep your keys safe, build multisig correctly, and self-test easily.
 
-| 文件 | 用途 |
-| ---- | ---- |
-| 🔑 `bitcoin_batch_keys.py` | 单签私钥/地址的批量生成、导入、查看（V1） |
-| 🏦 `bitcoin_multisig_v2.py` | 多签地址生成与端到端验签（V2，仅比特币主网） |
+| File | Purpose |
+| ---- | ------- |
+| 🔑 `bitcoin_batch_keys.py` | Single-signer key/address batch generation, import, and viewer (V1) |
+| 🏦 `bitcoin_multisig_v2.py` | Multisig address generation and end-to-end sign/verify suite (V2, Bitcoin mainnet only) |
 
-运行都不需要第三方钱包库。安装了 `coincurve / ecdsa / bech32m / bech32 / base58` 会优先使用；没装则自动回退到文件内置的等价实现，所需用到的只是 Python 3.8+ 标准库。
+Both are Python 3.8+ and need only the standard library to run. If `coincurve`, `ecdsa`, `bech32m`, `bech32`, or `base58` are installed they are used first; otherwise each file falls back to its built-in equivalents. Copy one file anywhere and run.
 
 ---
 
-## 🔑 V1 `bitcoin_batch_keys.py` —— 单签批量工具
+## 🔑 V1 — `bitcoin_batch_keys.py` (single-signer)
 
-批量生成比特币 WIF 私钥 + 各类单签地址，适合批量留存、回收地址备用、离线管理。
+Batch-generate WIF private keys and derive all single-signer address types. Useful for bulk key storage, backup address collection, and offline management.
 
 ```bash
-python bitcoin_batch_keys.py                 # 直接运行（或双击）进入中文菜单
+python bitcoin_batch_keys.py                 # Run (or double-click) to enter the Chinese menu
 ```
 
-子命令：
+Sub-commands:
 
 ```bash
-python bitcoin_batch_keys.py gen -c 20 -o keys.txt   # 🔑 批量生成 20 个密钥，私钥写入文件
-python bitcoin_batch_keys.py gen -c 3 -d             # 🧾 3 个，明细视图（十六进制私钥 / 公钥 / 锁定脚本）
-python bitcoin_batch_keys.py import -i keys.txt      # 📥 导入之前保存的文件（文件以 END 结尾）
-python bitcoin_batch_keys.py info bc1q... 1Abc...    # 🔍 查看地址信息
-python bitcoin_batch_keys.py selftest                # ✅ 内置自检（13 项）
+python bitcoin_batch_keys.py gen -c 20 -o keys.txt   # 🔑 Batch-generate 20 keys, write WIFs to a file
+python bitcoin_batch_keys.py gen -c 3 -d             # 🧾 3 keys, detailed view (hex private key / pubkey / lock script)
+python bitcoin_batch_keys.py import -i keys.txt      # 📥 Import a file saved earlier (must end with END)
+python bitcoin_batch_keys.py info bc1q... 1Abc...    # 🔍 Inspect addresses
+python bitcoin_batch_keys.py selftest                # ✅ Built-in self-test (13 checks)
 ```
 
-`gen` 常用参数：
+`gen` options:
 
-- `-c/--count`：数量，默认 10
-- `--no-compression`：WIF 不带压缩标志
-- `-n/--network {bc,btc,tb}`：网络前缀，默认 `bc`（主网）
-- `--kinds`：指定输出脚本类型，逗号分隔
-- `-f/--format {block,line,csv,json}`：输出格式，默认 `block`
-- `-d`：block 格式下改用明细视图
-- `-o`：输出文件；写文件时每行一个 WIF，可用 `import` 读回
+- `-c/--count`: how many, default 10
+- `--no-compression`: WIF without the compression flag
+- `-n/--network {bc,btc,tb}`: network prefix, default `bc` (mainnet)
+- `--kinds`: comma-separated script types to output
+- `-f/--format {block,line,csv,json}`: output format, default `block`
+- `-d`: detailed view under `block` format
+- `-o`: output file; when writing to a file each line is one WIF, importable via `import`
 
-支持的地址类型：P2PKH（`1...`）、P2SH-P2WPKH（`3...`）、P2WPKH（`bc1q...`，BIP84）、P2TR（`bc1p...`，BIP86）。
+Supported address types: P2PKH (`1...`), P2SH-P2WPKH (`3...`), P2WPKH (`bc1q...`, BIP84), P2TR (`bc1p...`, BIP86).
 
 ---
 
-## 🏦 V2 `bitcoin_multisig_v2.py` —— 多签工具（主网）
+## 🏦 V2 — `bitcoin_multisig_v2.py` (multisig, mainnet)
 
-只做两件事：生成多签地址、验证地址的签名逻辑按预期工作。
+Does two things: generate multisig addresses and verify that the signing logic for an address behaves as intended.
 
-- ✅ **bc1q（P2WSH）**：`m-of-n` 任意 m 人签即可，比如 3-of-5、2-of-3；
-- ✅ **bc1p（Taproot）**：`n-of-n` 全员签名，一个都不能少；`chain` 与 `tree` 两种布局。
+- ✅ **bc1q (P2WSH)**: arbitrary `m-of-n` (e.g. 3-of-5, 2-of-3)
+- ✅ **bc1p (Taproot)**: `n-of-n`, every member must sign; `chain` and `tree` layouts
 
-运行子命令或菜单：
+Sub-commands:
 
 ```bash
-python bitcoin_multisig_v2.py build -t p2wsh -m 3      # 生成 3-of-n 方案
-python bitcoin_multisig_v2.py build -t both -m 2       # 同时看 bc1q 和 bc1p
-python bitcoin_multisig_v2.py keys -c 5                # 随机生成 5 个成员密钥
-python bitcoin_multisig_v2.py inspect bc1q...          # 解析地址
-python bitcoin_multisig_v2.py selftest -v              # 31 项官方向量自检
+python bitcoin_multisig_v2.py build -t p2wsh -m 3      # Generate a 3-of-n plan
+python bitcoin_multisig_v2.py build -t both -m 2       # See both bc1q and bc1p
+python bitcoin_multisig_v2.py keys -c 5                # Generate 5 random member keys
+python bitcoin_multisig_v2.py inspect bc1q...          # Inspect an address
+python bitcoin_multisig_v2.py selftest -v              # 31 official-vector checks
 ```
 
-菜单（回车 = 默认）：
+Menu (press Enter at each prompt for the default):
 
 ```
-1  一键生成多签方案
-     → 输入 3v2（5v3 / 只写人数也行），程序自动创建私钥、
-       逐项校算「公钥确实由对应私钥推出」、给出 bc1q / bc1p 地址、
-       端到端验签报告、描述符，最后才问要不要存文件。
-2  用自己的名单生成
-     → 粘贴 xpub / 公钥 / 私钥（WIF、hex、十进制、33 字节压缩公钥、"x:"+x-only 公钥）
-3  解析地址
-4  自检
-0  退出
+1  One-shot multisig plan
+     → type "3v2" ("5v3" or just the member count works too). The program creates
+       keys, cross-checks that each public key really derives from its private key,
+       prints the bc1q / bc1p addresses and descriptors, an end-to-end verify
+       report, and only then asks whether to save.
+2  Use your own member list
+     → paste xpub / public keys / private keys
+       (WIF, hex, decimal, 33-byte compressed pubkey, "x:"+x-only pubkey)
+3  Inspect address
+4  Self-test
+0  Quit
 ```
 
-`build` 参数摘要：
+`build` options in short:
 
-- `-t {p2wsh,p2tr,both}`：方案类型，默认 `p2wsh`；
-- `-m`：m-of-n 需要几个签名（bc1p 永远是全员）；
-- `--order {bip67,fingerprint}`：公钥排序，默认 BIP67 字节升序；
-- `--layout {chain,tree}`：Taproot 结构；
-- `-d/--detail`：显示脚本、控制块、merkle 路径等；
-- `--verify`：顺便做一次端到端签名验证；
-- `-f {block,json}` / `-o` / `-v`。
+- `-t {p2wsh,p2tr,both}`: which plan, default `p2wsh`
+- `-m`: how many signatures for m-of-n (bc1p is always full)
+- `--order {bip67,fingerprint}`: pubkey ordering, default BIP67 byte order
+- `--layout {chain,tree}`: Taproot structure
+- `-d/--detail`: scripts, control blocks, merkle paths
+- `--verify`: also run an end-to-end signature check
+- `-f {block,json}` / `-o` / `-v`
 
-输入时会逐项核对：每条「公钥」都重新从所附私钥推全比对，不匹配会标红「异常」。
+When you paste members, each entry is cross-checked: every public key is re-derived from the attached private key and compared; mismatches are flagged as an error.
 
 ---
 
-## 🟰 bc1q 和 bc1p 分别是什么？
+## 🟰 What are bc1q and bc1p?
 
-### 🟨 bc1q（P2WSH，SegWit v0）
+### 🟨 bc1q (P2WSH, SegWit v0)
 
-- 地址以 `bc1q...` 开头，SegWit v0；见证程序是 20 字节的 witness script 的 hash160。
-- 多签脚本是标准的 `OP_m <pubkey1> ... <pubkeyn> OP_n OP_CHECKMULTISIG`。
-- 花费时每把私钥各自签名，见证里放 `签名列表 + 完整脚本`，链上把脚本解锁逻辑亮出来。
-- **适合**：m-of-n 场景（2-of-3、3-of-5 等）、需要任意 m 人就能花。
-- **优点**：多签门槛灵活；比早期 `3...`（P2SH）多签更省手续费；已被所有 SegWit 钱包/交易所广泛支持。
-- **限制**：门槛在地址创建时就定死，后续改门槛等于换地址；一个地址只支持一种门槛。
-- 本工具输出的描述符形如 `wsh(sortedmulti(3,02aa...,03bb...,...))`。
+- Address starts with `bc1q...`, SegWit v0; the witness program is the hash160 of a 20-byte witness script.
+- The multisig script is the standard `OP_m <pubkey1> ... <pubkeyn> OP_n OP_CHECKMULTISIG`.
+- Spending puts `signature list + full script` in the witness, so the unlocking logic is visible on-chain.
+- **Good for**: m-of-n (2-of-3, 3-of-5, ...) where any m signers suffice.
+- **Pros**: flexible threshold; cheaper than the old `3...` (P2SH) multisig; broadly supported by SegWit wallets and exchanges.
+- **Limits**: the threshold is fixed when the address is created; changing it means a new address; one address encodes one threshold.
+- Descriptor produced by this tool looks like `wsh(sortedmulti(3,02aa...,03bb...,...))`.
 
-### 🟪 bc1p（Taproot，SegWit v1，BIP340/341/342）
+### 🟪 bc1p (Taproot, SegWit v1, BIP340/341/342)
 
-- 地址以 `bc1p...` 开头，SegWit v1，Bech32m 编码。
-- Taproot 输出同时支持两种路径：**key path**（聚合/调整后的单一 Schnorr 签名）与**脚本路径**（Merkle 树 + 控制块揭示某一片脚本）。
-- 本工具的 bc1p 用的是 NUMS 内部公钥（任何人都不知道它的离散对数），所以**key path 天然不能花**，只能走脚本路径 ⇒ 真正强制 `n-of-n` 全员签名。
-- 全员签名不是 `OP_CHECKMULTISIG`，而是一条 `CHECKSIG / CHECKSIGVERIFY` 链：`pk1 OP_CHECKSIGVERIFY pk2 OP_CHECKSIGVERIFY ... pkn OP_CHECKSIG`。
-- **适合**：n-of-n 冷钱包/公司金库/高安全资产托管。
-- **优点**：全员必签，安全模型最严；脚本路径只揭示用到的那一片，隐私更好；未来可以平滑升级到 BIP342 脚本集；Schnorr 签名更短。
-- **限制**：必须所有成员都签，少一个就完全不能花；不适合 m-of-n（如 2-of-3）这种要"部分人就行"的场景（那种请用 bc1q）。
-- 本工具输出的描述符形如 `tr(<NUMS>,and_v(v:pk(...),...))`。
+- Address starts with `bc1p...`, SegWit v1, Bech32m-encoded.
+- A Taproot output supports two paths: **key path** (a single aggregated/adjusted Schnorr signature) and the **script path** (a Merkle tree + control block revealing one leaf script).
+- This tool uses a NUMS internal key (whose discrete log nobody knows), so the **key path cannot be spent** — only the script path is spendable, which means `n-of-n` is genuinely enforced.
+- Full-signature spending is not `OP_CHECKMULTISIG` but a `CHECKSIG / CHECKSIGVERIFY` chain: `pk1 OP_CHECKSIGVERIFY pk2 OP_CHECKSIGVERIFY ... pkn OP_CHECKSIG`.
+- **Good for**: n-of-n cold wallets / corporate vaults / high-value custody.
+- **Pros**: strictest model — every member must sign; the script path reveals only the leaf actually used, better privacy; smooth upgrade path to BIP342 scripts; shorter Schnorr signatures.
+- **Limits**: all members must sign; missing even one blocks spending entirely. Not for "any m of n" cases (use bc1q for that).
+- Descriptor produced by this tool looks like `tr(<NUMS>,and_v(v:pk(...),...))`.
 
-### 🛠️ 怎么选？
+### 🛠️ Which one should I use?
 
-| 需求 | 推荐 |
-| ---- | ---- |
-| 2-of-3、3-of-5，任意 m 人就行 | 🟨 **bc1q** |
-| 全员必须签才算数 | 🟪 **bc1p** |
-| 想省手续费、又要多签 | bc1q；bc1p 全签脚本路径单笔花费通常更省 |
-| 想看地址长得直观、随便查 | bc1q |
-| 想要最严苛的"少一个都花不了" | bc1p |
+| Need | Recommendation |
+| ---- | -------------- |
+| 2-of-3, 3-of-5, any m will do | 🟨 **bc1q** |
+| Everyone must sign | 🟪 **bc1p** |
+| Lower fee + multisig | bc1q; a full-sign Taproot script-path spend is usually cheaper still |
+| Want a familiar, easy-to-inspect address | bc1q |
+| Want the strictest "spend only if every key signs" | bc1p |
 
 ---
 
-## ✅ 自检与官方向量
+## ✅ Self-tests and official vectors
 
-两种工具都内置 `selftest`，逐项比对官方测试向量：BIP32（xpub）、BIP340（Schnorr）、BIP341（Taproot tweak/输出公钥）、BIP143（签名哈希）、BIP380（描述符校验和）、BIP173/BIP350（地址编码）。改动共识代码后请运行：
+Both tools ship a `selftest` that cross-checks official test vectors: BIP32 (xpub), BIP340 (Schnorr), BIP341 (Taproot tweak / output key), BIP143 (signature hash), BIP380 (descriptors), BIP173/BIP350 (address encoding). If you touch consensus logic, run:
 
 ```bash
 python bitcoin_multisig_v2.py selftest
 python bitcoin_batch_keys.py selftest
 ```
 
-## ⚠️ 安全提醒
+## ⚠️ Security notes
 
-- WIF 私钥 = 签名权。生成的私钥只保留在自己的机器里。
-- 多方建多签时，**只交换公钥（或 xpub）**，绝不发送私钥。
-- 正式上账前先跑一遍 `--verify`，确认地址逻辑符合预期。
+- WIF private keys are signing authority. Keep generated keys only on your own machine.
+- For a multisig setup, only exchange **public keys** (or xpubs) — never share private keys.
+- Run `--verify` on a generated address before funding it.
 
 ## 📄 License
 
-MIT License, Copyright (c) 2026 Alex Walker. 详见 `LICENSE`。
+MIT License, Copyright (c) 2026 Alex Walker. See `LICENSE`.
