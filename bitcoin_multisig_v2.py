@@ -1,39 +1,163 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# =================================================================
-# Bitcoin Multisig Address Generation and Verification Tool — V2
+# =============================================================================
+# Bitcoin Multisig Address Generation and Verification Tool --- V2
 #
-# Double-click this file (or run it without arguments) to open the interactive menu;
-# the CLI subcommands work from the command line too.
+# [About this script]
+# A single file, fully offline, with no dependency on any wallet-level or
+# third-party multisig wrapper. It generates two kinds of mainnet multisig
+# addresses and then actually runs the spending transaction through its own
+# script interpreter, proving that the address and the threshold behave as
+# expected instead of merely computing a string and showing it to you.
 #
-# Two multisig mechanisms are supported. They are different, so do not mix them:
+# Double-click this file (or run it with no arguments) to enter the English
+# menu; the command line can be used directly as well:
 #
-# 1) Native SegWit multisig (P2WSH), addresses start with bc1q, m-of-n
-#    Script: OP_m <pubkey 1> ... <pubkey n> OP_n OP_CHECKMULTISIG
-#    Address: bech32(witness v0, hash160(witnessScript))
-#    Properties: any m members can sign to spend; changing the member set changes the address.
+#   python bitcoin_multisig_v2_en.py                             enter the English menu
+#   python bitcoin_multisig_v2_en.py build keys.txt -t both -d --verify
+#   python bitcoin_multisig_v2_en.py keys -c 10                 make 10 test keys
+#   python bitcoin_multisig_v2_en.py inspect bc1q...            parse one address
+#   python bitcoin_multisig_v2_en.py selftest -v                run the official vectors
 #
-# 2) Taproot multisig, addresses start with bc1p (P2TR script path), N-of-N full signing
-#    One tapscript leaf per member: <32-byte x-only pubkey> OP_CHECKSIG
-#    The leaves form a TapTree to get the merkle root, which tweaks the NUMS internal key.
-#    Address: bech32m(witness v1, output_key)
-#    Properties: all members must sign; none may be missing. Taproot has no OP_CHECKMULTISIG,
-#    so m-of-n is impossible in script; the common alternative is MuSig2 key aggregation,
-#    or the script-path + full-signing approach used by this file.
-#    Security: the internal key is the BIP341 NUMS point, whose discrete log is unknown,
-#    so the key path cannot be spent; funds can move only via the script path with every
-#    member signing. The internal key must NOT be the base point G — G's discrete log is 1,
-#    so anyone could compute the tweaked private key and bypass the multisig entirely.
+# Member input formats (mix freely, one per line):
+#   WIF private key / 64-hex-digit private key / decimal private key /
+#   33-byte compressed pubkey / 65-byte uncompressed pubkey / 32-byte x-only pubkey
+#   (Taproot only)
 #
-# Member input: WIF private key / 64-hex private key / decimal private key /
-# 33-byte compressed pubkey / 65-byte uncompressed pubkey / 32-byte x-only pubkey (Taproot only)
+# Two kinds of multisig are supported. The mechanisms differ, do not mix them:
 #
-# -----------------------------------------------------------------
-# Implementation notes: prefer installed libraries (coincurve/ecdsa/bech32m/bech32/base58);
-# any that are missing fall back to the equivalent built-in implementations in this file,
-# so a single copied file still runs. No wallet-level or third-party multisig wrapper is used;
-# signature hashes are implemented directly from the BIP specifications.
-# =================================================================
+#   1) bc1q prefix - native SegWit multisig (P2WSH) - m-of-n
+#      Any m members' signatures can spend. Members may be added or removed
+#      without changing the address structure, but once the member set changes
+#      the address must change, so all participants have to agree in advance on
+#      the same public keys and the same ordering.
+#
+#   2) bc1p prefix - Taproot script-path multisig (P2TR) - N-of-N
+#      The member public keys are chained into one CHECKSIG chain and every
+#      member has to sign; not one can be missing. Taproot has no
+#      OP_CHECKMULTISIG, so m-of-n cannot be done inside a single script (MuSig2
+#      key aggregation is a different scheme and out of scope for this file).
+#      Security: the internal key is fixed to BIP341's NUMS point, nobody knows
+#      its discrete logarithm, so the key path cannot spend and the funds can
+#      only be moved by a script path where everybody signs. Never use the base
+#      point G as the internal key here - G's discrete logarithm is 1, so
+#      anybody can compute the tweak and privatize it alone, which bypasses the
+#      multisig completely.
+#
+# [Core logic and formulas]
+#
+#   0. Curve basics
+#      secp256k1: y^2 = x^3 + 7 (mod p)
+#      p = 2^256 - 2^32 - 977, b = 7, base point order n
+#      (PRIME, CURVE_B, ORDER in the code)
+#      public key point Q = d * G
+#      compressed pubkey = (0x02 | 0x03) || x(32B), first byte = 2 + (y mod 2)
+#      lift_x(x): y = (x^3 + 7)^((p+1)/4) mod p, take the even y
+#
+#   1. Hashes
+#      hash160(d)         = RIPEMD160(SHA256(d))            20-byte digest
+#      double_sha256(d)   = SHA256(SHA256(d))               Base58Check checksum
+#      tagged_hash(tag,d) = SHA256(SHA256(tag) || SHA256(tag) || d)
+#                          the domain-separated hash of BIP340/341/342
+#
+#   2. bc1q address (P2WSH, m-of-n)
+#      witnessScript = OP_m <pk1> ... <pk_n> OP_n OP_CHECKMULTISIG
+#        OP_k is encoded as 0x50 + k (k = 1...16), and OP_0 is 0x00;
+#        you must not write bytes([k]) directly, that yields invalid 0x01...0x10
+#        the public keys are sorted ascending by bytes (BIP67; everyone must
+#        agree, otherwise the addresses all differ)
+#      scriptPubKey  = 0x00 0x14 || hash160(witnessScript)      34 bytes in total
+#      address = bech32("bc", witness version 0 || convertbits(program, 8->5))
+#        the checksum uses the BCH polynomial (BIP173, constant 1; witness version
+#        >= 1 uses bech32m, BIP350, constant 0x2BC830A3):
+#          chk = ((chk & 0x1FFFFFF) << 5) ^ v
+#          each step also XORs the generators selected by the 5 bits of chk >> 25
+#
+#   3. bc1p address (P2TR, N-of-N all signatures)
+#      leaf script = push(x-only 32B) || OP_CHECKSIG, the form used by the tree
+#                   layout with "one leaf per member"; the default chain layout
+#                   strings N public keys into one CHECKSIGVERIFY chain (with a
+#                   single trailing CHECKSIG), and the whole chain counts as one leaf
+#      leaf hash = tagged_hash("TapLeaf", 0xC0 || compact_size(len) || script)
+#      branch hash = tagged_hash("TapBranch", min(a,b) || max(a,b))   ascending
+#      Merkle root = pairwise merges bottom-up; with an odd number of leaves the
+#                   left side takes the first floor(n/2), so 3 leaves give
+#                   [l0, [l1, l2]], the same shape as the BIP341 official vectors
+#                   (the chain layout has a single leaf, so the Merkle root is
+#                   exactly that leaf hash)
+#      tweak  = tagged_hash("TapTweak", internal key x || merkle root)
+#               note there is no 0x00 prefix: an early draft had
+#               0x00 || p || merkleRoot, and copying that draft gives a wrong address
+#      output point Q = lift_x(internal key) + tweak * G, and tweak >= n is invalid
+#      scriptPubKey = 0x51 0x20 || Q.x(32B)
+#      address = bech32m("bc", witness version 1, Q.x)
+#      control block = (leaf version | Q.y parity) || internal key x ||
+#                      the sequence of sibling hashes; the verifier recomputes the
+#                      Merkle root from the siblings and then the tweak, so no other
+#                      script can be smuggled in
+#      internal key = BIP341's NUMS point H (x = 50929b74...03ac0), see NUMS_X
+#
+#   4. Signature hashes
+#      P2WSH follows BIP143, the final result is double_sha256(preimage):
+#        preimage = version || hashPrevouts || hashSequence || outpoint ||
+#                   compact_size(len) || witnessScript || amount (8B LE) ||
+#                   sequence || hashOutputs || locktime || hash_type
+#        the three hashes are decided by hash_type; when the input index exceeds
+#        the number of outputs, hashOutputs is 32 zero bytes instead of the old
+#        algorithm's 0x01 sentinel value
+#      Taproot follows BIP341: SigMsg starts with 0x00, then
+#      tagged_hash("TapSighash", ...):
+#        without ANYONECANPAY, what follows nLockTime is sha_prevouts,
+#        sha_amounts, sha_scriptpubkeys, sha_sequences
+#        when the low 2 bits of hash_type are NONE/SINGLE, sha_outputs is
+#        omitted entirely, not filled with 32 zero bytes
+#        the script path additionally appends
+#        tapleaf_hash(32B) || 0x00 || codesep_pos(4B LE), and if OP_CODESEPARATOR
+#        never ran, write 0xffffffff - those 37 bytes cannot be skipped
+#
+#   5. Threshold verification (the scripts really run during the self-test)
+#      P2WSH: execute OP_CHECKMULTISIG with Bitcoin Core semantics - a signature
+#             count of zero fails immediately; signatures must appear in public
+#             key order and cannot skip ahead to sign a later key
+#      bc1p:  a CHECKSIGVERIFY chain plus a trailing CHECKSIG; one missing
+#             signature breaks the chain, so it must fail
+#
+#   6. BIP32 non-hardened derivation (multisig member paths are all 0/0/*)
+#      I = HMAC-SHA512(chain_code, pubkey || index_be32), the left half is the
+#      private key and the right half the chain code
+#      the left half must satisfy 0 < I_L < n, otherwise that index is invalid
+#      child point = lift_x(I_L) * G + parent point
+#
+#   7. Descriptor checksum (BIP380)
+#      after mapping the characters into 5-bit groups, run the polymod:
+#        chk = ((chk & 0x7FFFFFFFF) << 5) ^ v
+#        each step XORs the generators selected by the 5 bits of chk >> 35; then
+#        8 zeros are appended and XORed with 1 so the final result is 0.
+#        Appending only one zero yields a wrong checksum
+#
+# [Naming conventions]
+#   Functions and variables: lower snake_case (push_data, taproot_tweak,
+#     wrap_value)
+#   Constants: UPPER_CASE (PRIME, ORDER, LINE_WIDTH, BECH32M_CONST)
+#   Data fields: lower snake_case, kept identical to the JSON output keys
+#     (address, descriptor, witness_script, merkle_root, ...)
+#   Two spots are deliberately left as they are; do not "tidy them up":
+#     (1) a...v, x/y/z, u1/u2 in the elliptic curve addition/multiplication
+#         formulas keep the standard notation, so they can be compared term by
+#         term against the EFD and the formulas in the literature;
+#     (2) field names such as internalPubkey, merkleRoot and hashType in the
+#         official vectors are copied verbatim from the BIP texts, so they can
+#         be diffed against the official documents.
+#
+# [Implementation and dependencies]
+#   Installed libraries are used when available (coincurve / ecdsa / bech32m /
+#   bech32 / base58); whichever one is missing falls back automatically to the
+#   equivalent built-in implementation in this file, so the single file still
+#   runs when it is copied elsewhere.
+#   All signature hashes are implemented from the BIP specifications. The
+#   bundled Schnorr/ECDSA signatures exist only for the self-test; in production
+#   use a mature wallet or HWI.
+# =============================================================================
 import argparse
 import hashlib
 import hmac
@@ -42,23 +166,24 @@ import os
 import secrets
 import sys
 import time
+import unicodedata
 
-if os.name == "nt":                               # Console encoding fix is only needed on Windows
+if os.name == "nt":                               # Console encoding tweak is only needed on Windows
     import ctypes
 else:
     ctypes = None
-#================= Optional encoding library: base58 =================
-try:                                             # Prefer: pip install base58
+# ================= Optional encoding library: base58 =================
+try:                                             # prefer `pip install base58`
     import base58
     HAVE_BASE58 = True
-except ImportError:                              # Fall back to the built-in implementation
+except ImportError:                              # fall back to the built-in implementation when missing
     HAVE_BASE58 = False
 
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"  # Omits easily confused characters 0 O I l
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"  # the easily confused 0 O I l are removed
 
 
-def b58_encode_builtin(data):
-    """Built-in Base58 encoding (only used if base58 library is not installed)."""
+def base58_encode_builtin(data):
+    """Built-in Base58 encoding (only used when the base58 library is missing)."""
     number = int.from_bytes(data, "big")
     encoded = ""
     while number:
@@ -71,12 +196,12 @@ def b58_encode_builtin(data):
     return encoded
 
 
-def b58_decode_builtin(text):
-    """Built-in Base58 decoding (only used if base58 library is not installed)."""
+def base58_decode_builtin(text):
+    """Built-in Base58 decoding (only used when the base58 library is missing)."""
     number = 0
     for char in text:
         if char not in BASE58_ALPHABET:
-            raise ValueError("Illegal Base58 character %r" % char)
+            raise ValueError("invalid Base58 character %r" % char)
         number = number * 58 + BASE58_ALPHABET.index(char)
     decoded = number.to_bytes((number.bit_length() + 7) // 8, "big") if number else b""
     for char in text:
@@ -86,41 +211,41 @@ def b58_decode_builtin(text):
     return decoded
 
 
-def b58_encode(data):
-    """Base58 encoding: Use the base58 library. If the library is missing, use the built-in implementation."""
+def base58_encode(data):
+    """Base58 encoding: use the base58 library, or the built-in implementation if it is missing."""
     if HAVE_BASE58:
         return base58.b58encode(data).decode("ascii")
-    return b58_encode_builtin(data)
+    return base58_encode_builtin(data)
 
 
-def b58_decode(text):
-    """Base58 decoding: Use the base58 library. If the library is missing, use the built-in implementation."""
+def base58_decode(text):
+    """Base58 decoding: use the base58 library, or the built-in implementation if it is missing."""
     if HAVE_BASE58:
         return base58.b58decode(text)
-    return b58_decode_builtin(text)
+    return base58_decode_builtin(text)
 
 
-#================= Optional encoding library: bech32m / bech32 =================
-try:                                             # Preferred bech32m: The same API covers both bech32 and bech32m
+# ================= Optional encoding libraries: bech32m / bech32 =================
+try:                                             # bech32m comes first: one API covers both bech32 and bech32m
     import bech32m
     HAVE_BECH32M = True
-except ImportError:                              # If it is missing, it will fall back to the bech32 library. If it is missing, it will use the built-in implementation.
+except ImportError:                              # on ImportError fall back to the bech32 library, then to the built-in code
     HAVE_BECH32M = False
 
-try:                                             # bech32 1.2.0 only implements BIP-173, bech32m constants need to be filled in by yourself
+try:                                             # bech32 1.2.0 only implements BIP-173, so the bech32m constant has to be added by hand
     import bech32
     HAVE_BECH32 = True
 except ImportError:
     HAVE_BECH32 = False
 
-BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"  #5-bit value to character mapping table
-BECH32_CONST = 1                                     # BIP-173 (witness v0) validation constants
-BECH32M_CONST = 0x2BC830A3                           # BIP-350 (witness v1+) validation constants
-BECH32_GENERATORS = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]  # Generate polynomial coefficients
+BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"  # map from 5-bit values to characters
+BECH32_CONST = 1                                     # BIP-173 (witness v0) checksum constant
+BECH32M_CONST = 0x2BC830A3                           # BIP-350 (witness v1+) checksum constant
+BECH32_GENERATORS = [0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3]  # generator polynomial coefficients
 
 
 def bech32_polymod(values):
-    """Built-in BCH checksum calculation (used when both libraries are missing)."""
+    """Built-in BCH checksum computation (used when both libraries are missing)."""
     checksum = 1
     for value in values:
         top = checksum >> 25
@@ -132,12 +257,12 @@ def bech32_polymod(values):
 
 
 def bech32_hrp_expand(hrp):
-    """Built-in HRP expansion: high-order 5-bit sequence + delimited 0 + low-order 5-bit sequence."""
+    """Built-in HRP expansion: the high 5-bit sequence + separator 0 + the low 5-bit sequence."""
     return [ord(char) >> 5 for char in hrp] + [0] + [ord(char) & 31 for char in hrp]
 
 
 def convert_bits(data, from_bits, to_bits, pad=True):
-    """Bit width conversion: 8 bit byte <-> 5 bit grouping, bech32m decoding requires pad=False."""
+    """Bit width conversion: 8-bit bytes <-> 5-bit groups; bech32m decoding needs pad=False."""
     if HAVE_BECH32:
         return bech32.convertbits(data, from_bits, to_bits, pad)
     accumulator = 0
@@ -162,7 +287,7 @@ def convert_bits(data, from_bits, to_bits, pad=True):
 
 
 def bech32_checksum(hrp, data, const):
-    """Generate 6 5-bit check characters, const determines whether it is bech32 or bech32m."""
+    """Build the 6 five-bit checksum characters; const decides bech32 vs bech32m."""
     if HAVE_BECH32 and const == BECH32_CONST:
         return bech32.bech32_create_checksum(hrp, data)
     polymod = bech32_polymod(bech32_hrp_expand(hrp) + list(data) + [0] * 6) ^ const
@@ -170,7 +295,7 @@ def bech32_checksum(hrp, data, const):
 
 
 def bech32_checksum_spec(hrp, data):
-    """Determine whether the checksum belongs to bech32 or bech32m, and return a constant or None (check failed)."""
+    """Decide whether a checksum is bech32 or bech32m; return the constant or None (verification failed)."""
     if HAVE_BECH32:
         if bech32.bech32_verify_checksum(hrp, data):
             return BECH32_CONST
@@ -190,7 +315,7 @@ def bech32_hrp_of_address(address):
 
 
 def segwit_encode(hrp, witness_version, witness_program):
-    """SegWit address encoding: v0 uses bech32, v1 and above use bech32m (automatically selected by the library according to version)."""
+    """SegWit address encoding: v0 uses bech32, v1 and above use bech32m (the library picks by version)."""
     if HAVE_BECH32M:
         return bech32m.encode(hrp, witness_version, witness_program)
     data = [witness_version] + convert_bits(list(witness_program), 8, 5)
@@ -200,8 +325,8 @@ def segwit_encode(hrp, witness_version, witness_program):
 
 
 def segwit_decode(address):
-    """SegWit address decoding, returns (hrp, witness_version, witness_program) or None."""
-    if HAVE_BECH32M:                                # The bech32m library comes with all legality checks
+    """SegWit address decoding; returns (hrp, witness_version, witness_program) or None."""
+    if HAVE_BECH32M:                                # the bech32m library performs every validity check itself
         hrp = bech32_hrp_of_address(address)
         if not hrp:
             return None
@@ -239,14 +364,14 @@ def segwit_decode(address):
     return hrp, data[0], bytes(program)
 
 
-#================= Hash =================
+# ================= Hashes =================
 def sha256(data):
-    """Single SHA-256."""
+    """A single SHA-256."""
     return hashlib.sha256(data).digest()
 
 
 def double_sha256(data):
-    """Double SHA-256, checksum source for Base58Check."""
+    """Double SHA-256, the source of the Base58Check checksum."""
     return sha256(sha256(data))
 
 
@@ -261,31 +386,31 @@ def tagged_hash(tag, data):
     return sha256(prefix + prefix + data)
 
 
-#================= secp256k1 curve parameters =================
-PRIME = 2 ** 256 - 2 ** 32 - 977  # Domain p
-ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # Basic point order n
-CURVE_B = 7                                    # Curve coefficient b
+# ================= secp256k1 curve parameters =================
+PRIME = 2 ** 256 - 2 ** 32 - 977  # field p
+ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141  # base point order n
+CURVE_B = 7                                    # curve coefficient b
 BASE_X = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 BASE_Y = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 
 
 def check_secret(secret):
-    """The verification private key falls in the secp256k1 scalar field [1, n-1]."""
+    """Check that the private key lies in the secp256k1 scalar field [1, n-1]."""
     if not isinstance(secret, int):
-        raise ValueError("Private key must be an integer")
+        raise ValueError("the private key must be an integer")
     if not 1 <= secret < ORDER:
-        raise ValueError("Private key exceeds secp256k1 valid range [1, n-1]")
+        raise ValueError("private key outside the valid secp256k1 range [1, n-1]")
     return secret
 
 
-#================= Optional curve library: coincurve/ecdsa =================
-try:                                             # coincurve binds libsecp256k1, the fastest
+# ================= Optional curve libraries: coincurve / ecdsa =================
+try:                                             # coincurve wraps libsecp256k1 and is the fastest
     import coincurve
     HAVE_COINCURVE = True
 except ImportError:
     HAVE_COINCURVE = False
 
-try:                                             # ecdsa: A standard ECDSA implementation in pure Python
+try:                                             # ecdsa: a standard ECDSA implementation in pure Python
     import ecdsa
     import ecdsa.ellipticcurve
     HAVE_ECDSA = True
@@ -297,12 +422,12 @@ if HAVE_COINCURVE:
 elif HAVE_ECDSA:
     CURVE_BACKEND = "ecdsa"
 else:
-    CURVE_BACKEND = "built-in"
+    CURVE_BACKEND = "builtin"
 
 
-#================= Built-in elliptic curve group operations (a catch-up when both libraries are missing) =================
+# ================= Built-in elliptic curve group operations (fallback when both libraries are missing) =================
 def jacobian_double(point):
-    """Double the Jacobian coordinates to avoid finding the modular inversion every time."""
+    """Doubling in Jacobian coordinates, so no modular inverse is needed every time."""
     x, y, z = point
     if y == 0 or z == 0:
         return (0, 0, 0)
@@ -319,7 +444,7 @@ def jacobian_double(point):
 
 
 def jacobian_add(point1, point2):
-    """Jacobian coordinate point plus."""
+    """Point addition in Jacobian coordinates."""
     x1, y1, z1 = point1
     x2, y2, z2 = point2
     if z1 == 0:
@@ -349,7 +474,7 @@ def jacobian_add(point1, point2):
 
 
 def jacobian_to_affine(point):
-    """Convert Jacobian coordinates to affine coordinates; return None for infinity points."""
+    """Convert Jacobian coordinates to affine; None for the point at infinity."""
     x, y, z = point
     if z == 0:
         return None
@@ -359,7 +484,7 @@ def jacobian_to_affine(point):
 
 
 def builtin_scalar_multiply(scalar):
-    """Built-in scalar multiplication: double-and-add, Jacobian coordinates."""
+    """Built-in scalar multiplication: double-and-add in Jacobian coordinates."""
     result = (0, 0, 0)
     addend = (BASE_X, BASE_Y, 1)
     while scalar:
@@ -371,7 +496,7 @@ def builtin_scalar_multiply(scalar):
 
 
 def builtin_point_add(first, second):
-    """Built-in affine coordinate point addition."""
+    """Built-in point addition in affine coordinates."""
     if first is None:
         return second
     if second is None:
@@ -388,9 +513,9 @@ def builtin_point_add(first, second):
     return (x3, (slope * (x1 - x3) - y1) % PRIME)
 
 
-#================= Elliptic curve operation entry (dispatched by backend) =================
+# ================= Elliptic curve entry points (dispatched by backend) =================
 def secret_to_point(secret):
-    """Private key -> affine coordinate curve point (x, y), that is, public key point Q = secret * G."""
+    """Private key -> curve point (x, y) in affine coordinates, i.e. the public key point Q = secret * G."""
     check_secret(secret)
     if HAVE_COINCURVE:
         return coincurve.PublicKey.from_valid_secret(secret.to_bytes(32, "big")).point()
@@ -401,7 +526,7 @@ def secret_to_point(secret):
 
 
 def point_add(first, second):
-    """Add affine coordinate points; returns None (point at infinity) when the two points are opposites of each other."""
+    """Point addition in affine coordinates; None when the two points are inverses (point at infinity)."""
     if first is None:
         return second
     if second is None:
@@ -420,7 +545,7 @@ def point_add(first, second):
         right = ecdsa.ellipticcurve.PointJacobi.from_affine(
             ecdsa.ellipticcurve.Point(curve, second[0], second[1]))
         total = left + right
-        # When P + (-P) ecdsa returns INFINITY (normal Point, coordinates are None), no to_affine()
+        # for P + (-P) ecdsa returns INFINITY (a plain Point whose coords are None); it has no to_affine()
         if total.x() is None or total.y() is None:
             return None
         if hasattr(total, "to_affine"):
@@ -429,9 +554,9 @@ def point_add(first, second):
     return builtin_point_add(first, second)
 
 
-#================= Public key serialization =================
+# ================= Public key serialization =================
 def public_key_bytes(point, compressed=True):
-    """Public key point to bytes: compressed 33 bytes (02/03 + x), uncompressed 65 bytes (04 + x + y)."""
+    """Curve point to bytes: 33 bytes compressed (02/03 + x), 65 bytes uncompressed (04 + x + y)."""
     x, y = point
     if compressed:
         return bytes([2 + (y & 1)]) + x.to_bytes(32, "big")
@@ -439,62 +564,62 @@ def public_key_bytes(point, compressed=True):
 
 
 def x_only_public_key(point):
-    """BIP340 x-only public key, only retains the x coordinate (32 bytes)."""
+    """BIP340 x-only public key, keeping only the x coordinate (32 bytes)."""
     return point[0].to_bytes(32, "big")
 
 
 def lift_x(x_bytes):
-    """BIP340 lift_x: Restore even y curve points from 32-byte x coordinates."""
+    """BIP340 lift_x: recover the curve point with even y from a 32-byte x coordinate."""
     x = int.from_bytes(x_bytes, "big")
     if not 0 <= x < PRIME:
-        raise ValueError("x-coordinate is outside domain range")
+        raise ValueError("x coordinate is outside the field range")
     y_square = (pow(x, 3, PRIME) + CURVE_B) % PRIME
     y = pow(y_square, (PRIME + 1) // 4, PRIME)
     if y * y % PRIME != y_square:
-        raise ValueError("x-coordinate is not on secp256k1 curve")
+        raise ValueError("x coordinate is not on the secp256k1 curve")
     return (x, y if y % 2 == 0 else PRIME - y)
 
 
 
 # ================= Base58Check =================
 def base58check_encode(payload):
-    """Base58Check: The payload is encoded after appending a 4-byte double SHA-256 checksum."""
-    return b58_encode(payload + double_sha256(payload)[:4])
+    """Base58Check: append a 4-byte double SHA-256 checksum to the payload, then encode."""
+    return base58_encode(payload + double_sha256(payload)[:4])
 
 
 def base58check_decode(text):
-    """Base58Check Decode and checksum."""
-    raw = b58_decode(text.strip())
+    """Decode Base58Check and verify the checksum."""
+    raw = base58_decode(text.strip())
     if len(raw) < 5:
-        raise ValueError("Base58Check data is too short")
+        raise ValueError("the Base58Check payload is too short")
     payload, checksum = raw[:-4], raw[-4:]
     if double_sha256(payload)[:4] != checksum:
-        raise ValueError("Base58Check checksum does not match")
+        raise ValueError("the Base58Check checksum does not match")
     return payload
 
 
-#================= Network and Script Constants =================
+# ================= Network and script constants =================
 WIF_VERSION = 0x80   # WIF private key version byte
-MAINNET = {                                    # This tool only works on the mainnet: Base58 version byte + Bech32 HRP
+MAINNET = {                                    # this tool only does mainnet: Base58 version byte + Bech32 HRP
     "name": "Bitcoin mainnet", "p2pkh": 0x00, "p2sh": 0x05, "hrp": "bc",
 }
-HRP_NAMES = {"bc": "Mainnet", "tb": "testnet", "bcrt": "Regtest"}   # Only used to label external addresses
-KNOWN_VERSIONS = {                                          # Base58 address version byte meaning
-    0x00: "P2PKH Mainnet", 0x05: "P2SH mainnet",
-    0x6F: "P2PKH testnet/Regtest", 0xC4: "P2SH testnet/Regtest",
+HRP_NAMES = {"bc": "mainnet", "tb": "testnet", "bcrt": "regtest"}   # only used to label addresses that come from elsewhere
+KNOWN_VERSIONS = {                                          # meaning of the Base58 address version bytes
+    0x00: "P2PKH mainnet", 0x05: "P2SH mainnet",
+    0x6F: "P2PKH testnet/regtest", 0xC4: "P2SH testnet/regtest",
 }
 
 
 
 
-#================= Private Key: Generate/WIF/Parse =================
+# ================= Private keys: generation / WIF / parsing =================
 def generate_secret():
-    """Each key is independently selected as a random scalar in the range [1, n-1] using secrets (rejection sampling, no modulo bias)."""
+    """Every key draws an independent random scalar with secrets over [1, n-1] (rejection sampling, no modulo bias)."""
     return secrets.randbelow(ORDER - 1) + 1
 
 
 def secret_to_wif(secret, compressed=True):
-    """Private Key -> WIF. A 0x01 flag is appended to the end of the compressed private key."""
+    """Private key -> WIF. A compressed private key gets a trailing 0x01 marker."""
     check_secret(secret)
     payload = bytes([WIF_VERSION]) + secret.to_bytes(32, "big")
     if compressed:
@@ -503,22 +628,22 @@ def secret_to_wif(secret, compressed=True):
 
 
 def wif_to_secret(wif):
-    """WIF -> (private key, whether to compress or not), while verifying the version bytes and length."""
+    """WIF -> (private key, is_compressed); the version byte and the length are validated too."""
     payload = base58check_decode(wif)
     if not payload or payload[0] != WIF_VERSION:
-        raise ValueError("Not a mainnet WIF private key (version byte should be 0x80)")
+        raise ValueError("not a mainnet WIF private key (the version byte should be 0x80)")
     if len(payload) == 34 and payload[-1] == 0x01:
         return check_secret(int.from_bytes(payload[1:33], "big")), True
     if len(payload) == 33:
         return check_secret(int.from_bytes(payload[1:33], "big")), False
-    raise ValueError("Illegal WIF length (expected 33 or 34 bytes)")
+    raise ValueError("illegal WIF length (it must be 33 or 34 bytes)")
 
 
 def parse_secret(text):
-    """Parse private key: WIF / 64-bit hex / decimal."""
+    """Parse a private key: WIF / 64 hex digits / decimal."""
     cleaned = text.strip()
     if not cleaned:
-        raise ValueError("Input is empty")
+        raise ValueError("the input is empty")
     if cleaned[0] in "5KL9c" and len(cleaned) >= 50:
         return wif_to_secret(cleaned)
     lowered = cleaned.lower()
@@ -528,20 +653,20 @@ def parse_secret(text):
         return check_secret(int(cleaned, 16)), True
     if cleaned.isdigit():
         return check_secret(int(cleaned)), True
-    raise ValueError("Unrecognized private key format (supports WIF / 64-bit hex / decimal)")
+    raise ValueError("unrecognized private key format (WIF / 64-hex-digit / decimal are supported)")
 
-#================= Script construction primitives =================
+# ================= Script construction primitives =================
 OP_CHECKSIG = 0xAC
 OP_CHECKSIGVERIFY = 0xAD
 OP_CHECKMULTISIG = 0xAE
 
 LEAF_TAPSCRIPT = 0xC0             # BIP341 leaf version 0xc0
-TAPSCRIPT_MAX_SIZE = 10_000       # Tapscript length limit
-MAX_MULTISIG_KEYS = 16            # OP_CHECKMULTISIG up to 16 public keys
+TAPSCRIPT_MAX_SIZE = 10_000       # tapscript size limit
+MAX_MULTISIG_KEYS = 16            # OP_CHECKMULTISIG takes at most 16 public keys
 
 
 def compact_size(number):
-    """Bitcoin variable-length integer (compact_size) encoding."""
+    """Encoding of Bitcoin's variable-length integer (compact_size)."""
     if number < 0:
         raise ValueError("compact_size cannot be negative")
     if number < 0xFD:
@@ -552,31 +677,32 @@ def compact_size(number):
         return b"\xfe" + number.to_bytes(4, "little")
     if number <= 0xFFFFFFFFFFFFFFFF:
         return b"\xff" + number.to_bytes(8, "little")
-    raise ValueError("compact_size is outside the 64-bit range")
+    raise ValueError("compact_size exceeds the 64-bit range")
 
 
 def push_data(data):
-    """Push data into the script stack: compact_size(length) + data."""
+    """Push data onto the script stack: compact_size(len) + data."""
     return compact_size(len(data)) + data
 
 
 def push_opcode(number):
     """Push a number from 0 to 16.
 
-OP_0 is 0x00, OP_1..OP_16 is 0x51..0x60.
-Never write bytes([number]) directly - that will get 0x01..0x10, which is not a legal opcode.
+    OP_0 is 0x00 and OP_1..OP_16 are 0x51..0x60.
+    Never write bytes([number]) directly -- that gives 0x01..0x10, which are
+    not valid opcodes.
     """
     if not 0 <= number <= MAX_MULTISIG_KEYS:
-        raise ValueError("Only OP_0 to OP_16 are supported. The m/n of multi-signature cannot exceed this range.")
+        raise ValueError("only OP_0 through OP_16 are supported; the multisig m/n cannot exceed that range")
     return b"" if number == 0 else bytes([0x50 + number])
 
 
-#================= Public key processing =================
+# ================= Public key handling =================
 def is_valid_pubkey(data):
-    """Verify that the public key bytes actually fall on the secp256k1 curve."""
+    """Check whether the public key bytes really lie on the secp256k1 curve."""
     try:
         if len(data) == 33 and data[0] in (2, 3):
-            # Compressed public key: lift_x success means that x³+7 is a quadratic remainder, and both prefixes are legal
+            # compressed pubkey: if lift_x succeeds then x^3+7 is a quadratic residue, so both prefixes are legal
             return lift_x(data[1:]) is not None
         if len(data) == 65 and data[0] == 4:
             x = int.from_bytes(data[1:33], "big")
@@ -592,159 +718,160 @@ def is_valid_pubkey(data):
 
 
 def compressed_pubkey(secret):
-    """Private key -> 33-byte compressed public key (multi-signature scripts must use compressed format)."""
+    """Private key -> 33-byte compressed public key (multisig scripts must use the compressed form)."""
     return public_key_bytes(secret_to_point(secret), True)
 
 
 def parse_pubkey(text):
-    """Unify the public key text entered by the user into bytes (33 / 65 / 32 bytes)."""
+    """Normalize user-supplied public key text into bytes (33 / 65 / 32 bytes)."""
     cleaned = text.strip()
     if not cleaned:
-        raise ValueError("Public key is empty")
+        raise ValueError("the public key is empty")
     try:
         data = bytes.fromhex(cleaned)
     except ValueError:
-        raise ValueError("Public key must be in hexadecimal")
+        raise ValueError("the public key must be hexadecimal")
     if not is_valid_pubkey(data):
-        raise ValueError("This is not a valid secp256k1 public key")
+        raise ValueError("this is not a valid secp256k1 public key")
     return data
 
 
 def pubkey_to_xonly(data):
-    """Public key -> 32 bytes x-only (BIP340 Taproot only recognizes x-coordinates)."""
+    """Public key -> 32-byte x-only (BIP340 Taproot only looks at the x coordinate)."""
     if len(data) == 32:
         return data
     if len(data) == 33:
         return data[1:]
     if len(data) == 65 and data[0] == 4:
         return data[1:33]
-    raise ValueError("The public key length is wrong, it should be 32 / 33 / 65 bytes")
+    raise ValueError("wrong public key length; it must be 32 / 33 / 65 bytes")
 
 
 def pubkey_to_compressed(data):
-    """Public key -> 33 bytes compressed public key; x-only prefixed according to even y convention (EIP-340 rules)."""
+    """Public key -> 33-byte compressed public key; x-only gets a prefix by the even-y convention (the EIP-340 rule)."""
     if len(data) == 33:
         return data
     if len(data) == 32:
         return bytes([0x02]) + data
     if len(data) == 65 and data[0] == 4:
         return bytes([0x02 + (int.from_bytes(data[33:], "big") & 1)]) + data[1:33]
-    raise ValueError("The public key length is wrong, it should be 32 / 33 / 65 bytes")
+    raise ValueError("wrong public key length; it must be 32 / 33 / 65 bytes")
 
 
 def key_fingerprint(pubkey):
-    """BIP32 fingerprint = the first 4 bytes of hash160 (compressed public key), used to number members during multi-signature coordination."""
+    """BIP32 fingerprint = the first 4 bytes of hash160(compressed pubkey), used to number the members while coordinating."""
     return hash160(pubkey_to_compressed(pubkey))[:4].hex()
 
 
 def sort_keys_bip67(pubkeys):
-    """BIP67: Sort by public key bytes in ascending order.
+    """BIP67: sort the public keys ascending by their bytes.
 
-For multi-signatures, everyone must use the same order, otherwise the addresses calculated by each will be different and the money will go to the wrong address.
+    Everyone doing a multisig must use the same order; otherwise each side
+    ends up with a different address and the money goes to the wrong one.
     """
     return sorted(pubkeys)
 
 
 def sort_keys_by_fingerprint(pubkeys):
-    """Sort by fingerprint (old practice before BIP67), only used to compare old wallets."""
+    """Sort by fingerprint (the old practice from before BIP67), only for comparison with old wallets."""
     return sorted(pubkeys, key=lambda item: (hash160(item)[:4], item))
 
 
-#================= P2WSH multi-sign (bc1q, m-of-n) =================
+# ================= P2WSH multisig (bc1q, m-of-n) =================
 def multisig_witness_script(threshold, pubkeys):
-    """Construct OP_m <pubkeys...> OP_n OP_CHECKMULTISIG.
+    """Build OP_m <pubkeys...> OP_n OP_CHECKMULTISIG.
 
-threshold = several member signatures required (m), pubkeys = public keys of all members (n).
+    threshold = how many members must sign (m), pubkeys = every member public key (n).
     """
     if not pubkeys:
-        raise ValueError("There must be at least one member public key")
+        raise ValueError("at least one member public key is required")
     count = len(pubkeys)
     if not 1 <= threshold <= count:
-        raise ValueError("Requires signatures from %d individuals, but only %d members total" % (threshold, count))
+        raise ValueError("%d signatures are needed but there are only %d members" % (threshold, count))
     if count > MAX_MULTISIG_KEYS:
-        raise ValueError("Bitcoin's OP_CHECKMULTISIG only supports up to 16 public keys")
+        raise ValueError("Bitcoin's OP_CHECKMULTISIG supports at most 16 public keys")
     body = b"".join(push_data(pubkey) for pubkey in pubkeys)
     return push_opcode(threshold) + body + push_opcode(count) + bytes([OP_CHECKMULTISIG])
 
 
 def p2wsh_script_pubkey(witness_script):
-    """P2WSH's scriptPubKey: OP_0 <20 bytes hash160(witnessScript)>."""
+    """The scriptPubKey of P2WSH: OP_0 <20-byte hash160(witnessScript)>."""
     return b"\x00\x14" + hash160(witness_script)
 
 
 def p2sh_p2wsh_script_pubkey(witness_script):
-    """P2SH-P2WSH's scriptPubKey (compatible with old wallets)."""
+    """The scriptPubKey of P2SH-P2WSH (for old wallet compatibility)."""
     return b"\xa9\x14" + hash160(b"\x00\x14" + hash160(witness_script)) + b"\x87"
 
 
 def p2sh_script_pubkey(redeem_script):
-    """scriptPubKey for old P2SH."""
+    """The scriptPubKey of legacy P2SH."""
     return b"\xa9\x14" + hash160(redeem_script) + b"\x87"
 
 
 def address_from_script_pubkey(script_pubkey):
-    """scriptPubKey -> address (including SegWit / P2SH-P2WSH / P2SH)."""
+    """scriptPubKey -> address (SegWit / P2SH-P2WSH / P2SH)."""
     if len(script_pubkey) == 22 and script_pubkey[0] == 0x00 and script_pubkey[1] == 0x14:
-        witness_script = None                 # Only hash, script cannot be restored
+        witness_script = None                 # only a hash is available; the script cannot be recovered
         return segwit_encode(MAINNET["hrp"], 0, script_pubkey[2:22]), witness_script
     if (len(script_pubkey) == 23 and script_pubkey[0] == 0xA9 and script_pubkey[1] == 0x14
             and script_pubkey[-1] == 0x87):
         return base58check_encode(bytes([MAINNET["p2sh"]]) + script_pubkey[2:22]), None
-    raise ValueError("scriptPubKey is not supported by this tool")
+    raise ValueError("this scriptPubKey is not supported by this tool")
 
 
 def p2wsh_address(witness_script):
-    """Native SegWit multi-signature address bc1q... (witness v0 + hash160)."""
+    """Native SegWit multisig address bc1q... (witness v0 + hash160)."""
     return segwit_encode(MAINNET["hrp"], 0, hash160(witness_script))
 
 
 def p2sh_p2wsh_address(witness_script):
-    """P2SH package P2WSH compatible address 3...."""
+    """The compatibility address 3... of P2SH wrapping P2WSH."""
     nested = b"\x00\x14" + hash160(witness_script)
     return base58check_encode(bytes([MAINNET["p2sh"]]) + hash160(nested))
 
 
 def p2sh_multisig_address(redeem_script):
-    """Old P2SH multi-signature address 3... (not recommended, all new wallets use P2WSH)."""
+    """Legacy P2SH multisig address 3... (not recommended; new wallets all use P2WSH)."""
     return base58check_encode(bytes([MAINNET["p2sh"]]) + hash160(redeem_script))
 
 
-#================= Taproot (bc1p, script path, N-of-N full signature) =================
-# The NUMS point of BIP341: No one knows its discrete logarithm, so the key path cannot be spent, and money can only be spent on the script path.
-# The internal public key must not be replaced by the base point G - the discrete logarithm of G is 1, anyone can figure out the tweak and private key it themselves,
-# This is equivalent to completely bypassing multi-signature. NUMS is always used here.
+# ================= Taproot (bc1p, script path, N-of-N everyone signs) =================
+# BIP341's NUMS point: nobody knows its discrete logarithm, so the key path cannot spend; the money can only move along the script path.
+# Never swap the internal public key for the base point G -- G's discrete logarithm is 1, so anybody can compute the tweak and turn it into a private key,
+# which bypasses the multisig completely. NUMS is fixed here.
 NUMS_X = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
 
 
 def tapleaf_hash(script, leaf_version=LEAF_TAPSCRIPT):
-    """BIP341 leaf hash = tagged_hash(\"TapLeaf\", leaf version || script length || script)."""
+    """BIP341 leaf hash = tagged_hash("TapLeaf", leaf version || script length || script)."""
     if not 0xC0 <= leaf_version <= 0xFE:
-        raise ValueError("Currently only tapscript leaf version 0xc0 is supported")
+        raise ValueError("only tapscript leaf version 0xc0 is supported at the moment")
     if len(script) > TAPSCRIPT_MAX_SIZE:
-        raise ValueError("tapscript exceeds 10KB limit")
+        raise ValueError("the tapscript exceeds the 10KB limit")
     return tagged_hash("TapLeaf", bytes([leaf_version]) + compact_size(len(script)) + script)
 
 
 def tapbranch_hash(first, second):
-    """BIP341 branch hashing: the two sub-hashes are arranged in ascending byte order and then hashed (the order cannot be reversed)."""
+    """BIP341 branch hash: sort the two child hashes ascending by bytes and hash them (the order must not be reversed)."""
     low, high = sorted([first, second])
     return tagged_hash("TapBranch", low + high)
 
 
 def build_taptree(leaf_hashes):
-    """A TapTree is constructed from a list of leaf hashes.
+    """Build a TapTree from a list of leaf hashes.
 
-Returns (merkle_root, paths), paths[i] is the side hash list of the i-th leaf (from bottom to top).
-When there are an odd number of leaves, cut into \"left = first floor(n/2), right = remaining\", so n=3 is obtained
-[l0, [l1, l2]], consistent with the BIP341 official vector.
-Note that BIP341 itself does not specify a tree shape: changing the same set of public keys to a different tree shape means changing the bc1p address.
-Therefore, the participating parties must agree on the tree shape (which must also be reflected in PSBT).
+    Returns (merkle_root, paths); paths[i] is the sibling hash list of leaf number i (bottom-up).
+    With an odd number of leaves the split is "left = the first floor(n/2), right = the rest", so n=3 gives
+    [l0, [l1, l2]], which matches the official BIP341 vectors.
+    Note that BIP341 itself does not fix the tree shape: the same public keys with another shape give another bc1p address,
+    so all the parties must agree on the shape in advance (and record it in the PSBT).
     """
     if not leaf_hashes:
-        raise ValueError("TapTree must have at least one leaf")
+        raise ValueError("the TapTree needs at least one leaf")
 
     def build(items):
-        """items = [(index, leaf hash)] -> (root hash, {index: [side branch...]})"""
+        """items = [(index, leaf hash)] -> (root hash, {index: [siblings...]})"""
         if len(items) == 1:
             index, digest = items[0]
             return digest, {index: []}
@@ -763,20 +890,20 @@ Therefore, the participating parties must agree on the tree shape (which must al
 
 
 def tapscript_leaf_for_key(pubkey_x32):
-    """Single-member tapscript leaf script: <32-byte x-only public key> OP_CHECKSIG."""
+    """The tapscript leaf script of a single member: <32-byte x-only pubkey> OP_CHECKSIG."""
     if len(pubkey_x32) != 32:
-        raise ValueError("Taproot leaf public key must be 32 bytes x-only")
+        raise ValueError("a Taproot leaf pubkey must be a 32-byte x-only key")
     return push_data(pubkey_x32) + bytes([OP_CHECKSIG])
 
 
 def tapscript_chain_for_keys(pubkeys_x32):
-    """String N public keys into a tapscript: CHECKSIGVERIFY at the front and CHECKSIG at the end.
+    """Chain N public keys into one tapscript: CHECKSIGVERIFY up front, CHECKSIG at the end.
 
-This is the correct structure for bc1p to implement \"full signature\". Taproot does not have OP_CHECKMULTISIG,
-If you want N people to sign, you have to write a signature chain by hand; if one signature chain is missing, the chain will be broken and the script will inevitably fail.
+    This is the right structure for "everyone signs" with bc1p. Taproot has no OP_CHECKMULTISIG,
+    so making all N people sign means hand-writing a signature chain; one missing signature breaks the chain and the script must fail.
     """
     if not pubkeys_x32:
-        raise ValueError("There must be at least one member public key")
+        raise ValueError("at least one member public key is required")
     parts = []
     last = len(pubkeys_x32) - 1
     for position, pubkey in enumerate(pubkeys_x32):
@@ -788,22 +915,22 @@ If you want N people to sign, you have to write a signature chain by hand; if on
 def build_taproot_plan(pubkeys_x32, layout="chain", internal_x=NUMS_X):
     """Turn a set of member public keys into a complete bc1p scheme.
 
-layout=\"chain\" (default, and the only structure that can truly force everyone to sign):
-A single leaf, script is a chain of N CHECKSIGs.
+    layout="chain"(the default, and the only shape that really enforces everyone signing):
+        a single leaf whose script is a chain of N CHECKSIGs.
 
-layout=\"tree\":
-Each member has a leaf, forming a TapTree. In this way, the address can also be calculated, but the script path of BIP341
-Spending one time can only prove one leaf, so it cannot express \"multiple people signing at the same time\".
-It is only suitable for locking mutually exclusive alternative scripts into the same address. This document retains it for alignment
-BIP341 official vector, and provides tree options for users familiar with PSBT.
+    layout="tree":
+        one leaf per member, forming a TapTree. The address can be computed, but a BIP341 script-path
+        spend can only prove one leaf at a time, so it cannot express "several people signing together",
+        it only fits locking mutually exclusive alternative scripts into one address. This file keeps it in order to line up with
+        BIP341 the official vectors and to give PSBT-savvy users the choice of a tree shape.
 
-The return value includes leaf script, merkle root, control block, output public key and witness stack template.
+    The return value holds the leaf scripts, the merkle root, the control blocks, the output key and the witness stack template.
     """
     keys = sorted(pubkeys_x32)
     if not keys:
-        raise ValueError("There must be at least one member public key")
+        raise ValueError("at least one member public key is required")
     if len(set(keys)) != len(keys):
-        raise ValueError("There are duplicate member public keys")
+        raise ValueError("duplicate member public keys")
 
     if layout == "chain":
         script = tapscript_chain_for_keys(keys)
@@ -843,56 +970,56 @@ The return value includes leaf script, merkle root, control block, output public
 
 
 def taproot_tweak(internal_x, merkle_root=None):
-    """t = tagged_hash(\"TapTweak\", internal public key x || merkle root).
+    """t = tagged_hash("TapTweak", internal key x || merkle root).
 
-Note that there is no 0x00 prefix here (the final version of BIP341 is directly spliced).
-The early draft was written as 0x00 || p || merkleRoot. If you copy the draft, the calculated address will be wrong.
+    Note there is no 0x00 prefix here (the final BIP341 just concatenates).
+    An early draft wrote 0x00 || p || merkleRoot; copying that draft yields the wrong address.
     """
     return tagged_hash("TapTweak", internal_x + (merkle_root or b""))
 
 
 def taproot_output_point(internal_x, merkle_root=None):
-    """Q = lift_x(internal public key) + t*G, returns the output point (x, y).
+    """Q = lift_x(internal key) + t*G; returns the output point (x, y).
 
-According to BIP341, the curve order t >= is invalid (fails directly instead of taking modulo the order).
+    As BIP341 specifies, t >= the curve order is invalid (fail outright instead of reducing modulo the order).
     """
     tweak = int.from_bytes(taproot_tweak(internal_x, merkle_root), "big")
     if tweak >= ORDER:
-        raise ValueError("TapTweak beyond curve level")
+        raise ValueError("the TapTweak is beyond the curve order")
     output = point_add(lift_x(internal_x), secret_to_point(tweak))
     if output is None:
-        raise ValueError("The output point is an infinite point")
+        raise ValueError("the output point is the point at infinity")
     return output
 
 
 def taproot_output_key(internal_x, merkle_root=None):
-    """Taproot outputs the public key (32 bytes x coordinate)."""
+    """The Taproot output public key (32-byte x coordinate)."""
     return taproot_output_point(internal_x, merkle_root)[0].to_bytes(32, "big")
 
 
 def taproot_script_pubkey(internal_x, merkle_root=None):
-    """P2TR's scriptPubKey: OP_1 <32 bytes output_key>."""
+    """The scriptPubKey of P2TR: OP_1 <32-byte output_key>."""
     return b"\x51\x20" + taproot_output_key(internal_x, merkle_root)
 
 
 def taproot_address(merkle_root, internal_x=NUMS_X):
-    """bc1p... address = bech32m(witness v1, output_key)."""
+    """The address bc1p... = bech32m(witness v1, output_key)."""
     return segwit_encode(MAINNET["hrp"], 1,
                          taproot_output_key(internal_x, merkle_root))
 
 
 def taproot_control_block(merkle_path, output_point, internal_x=NUMS_X,
                           leaf_version=LEAF_TAPSCRIPT):
-    """Control block = (leaf version | output point parity bits) || internal public key || side hash sequence.
+    """The control block = (leaf version | output point parity) || internal key || sibling hash sequence.
 
-The verifier can use the side branch to recalculate the merkle root and then recalculate the tweak to confirm that the leaf indeed belongs to the address.
-There is no way to shoehorn other scripts in.
+    The verifier recomputes the merkle root from the siblings and then the tweak, which proves this leaf really belongs to the address,
+    so no other script can be forced in.
     """
     parity = output_point[1] & 1
     return bytes([(leaf_version & 0xFE) | parity]) + internal_x + b"".join(merkle_path)
-#================= Transaction analysis (used to calculate signature hash) =================
+# ================= Transaction parsing (needed to compute the signature hashes) =================
 class TxInput(object):
-    """A transaction input. Outpoint directly stores 36 bytes (txid little endian + index little endian)."""
+    """One transaction input. The outpoint stores 36 bytes directly (txid little-endian + index little-endian)."""
 
     def __init__(self, outpoint, script_sig=b"", sequence=0xFFFFFFFF, witness=None):
         self.outpoint = outpoint
@@ -902,7 +1029,7 @@ class TxInput(object):
 
 
 def make_outpoint(txid_hex, index):
-    """Transaction hash hex (positive order) + index -> 36 bytes outpoint (internal little endian)."""
+    """Transaction hash in hex (forward order) + index -> the 36-byte outpoint (little-endian inside)."""
     raw = bytes.fromhex(txid_hex)[::-1]
     return raw + index.to_bytes(4, "little")
 
@@ -924,11 +1051,11 @@ class Transaction(object):
         self.locktime = locktime
 
     def serialize(self, with_witness=False):
-        """Output SegWit format (0x00 0x01 + witness data) when with_witness=True.
+        """With with_witness=True, output the SegWit format (0x00 0x01 + witness data).
 
-Pay attention to the field order (BIP144):
+        Mind the field order (BIP144):
             version | marker | flag | txins | txouts | witnesses | locktime
-The witness data is sandwiched between the output and the locktime, not behind the locktime.
+        the witness data sits **between** the outputs and the locktime, not after the locktime.
         """
         has_witness = any(item.witness for item in self.inputs)
         use_witness = bool(with_witness and has_witness)
@@ -952,34 +1079,34 @@ The witness data is sandwiched between the output and the locktime, not behind t
 
 
 def read_compact_size(data, offset):
-    """Read compact_size from data[offset:], return (number, new offset)."""
+    """Read a compact_size from data[offset:]; returns (value, new offset)."""
     if offset >= len(data):
-        raise ValueError("Data ends early when reading length")
+        raise ValueError("the data ends while reading a length")
     first = data[offset]
     offset += 1
     if first < 0xFD:
         return first, offset
     sizes = {0xFD: 2, 0xFE: 4, 0xFF: 8}
     if first not in sizes:
-        raise ValueError("The first byte of compact_size is illegal: 0x%02x" % first)
+        raise ValueError("illegal compact_size first byte: 0x%02x" % first)
     width = sizes[first]
     if offset + width > len(data):
-        raise ValueError("Data ends early when reading length")
+        raise ValueError("the data ends while reading a length")
     return int.from_bytes(data[offset:offset + width], "little"), offset + width
 
 
 def read_compact_size_item(data, offset):
-    """Read compact_size + the subsequent data and return (data, new offset)."""
+    """Read a compact_size plus the data after it; returns (data, new offset)."""
     length, offset = read_compact_size(data, offset)
     if offset + length > len(data):
-        raise ValueError("Data ends early while reading content")
+        raise ValueError("the data ends while reading the contents")
     return data[offset:offset + length], offset + length
 
 
 def parse_transaction(raw):
-    """Parse the original transaction bytes and return Transaction."""
+    """Parse raw transaction bytes; returns a Transaction."""
     if len(raw) < 10:
-        raise ValueError("Transaction data is too short")
+        raise ValueError("the transaction data is too short")
     offset = 0
     version = int.from_bytes(raw[offset:offset + 4], "little")
     offset += 4
@@ -992,7 +1119,7 @@ def parse_transaction(raw):
     for _ in range(count):
         outpoint = raw[offset:offset + 36]
         if len(outpoint) != 36:
-            raise ValueError("Transaction input was truncated")
+            raise ValueError("the transaction inputs are truncated")
         offset += 36
         script_sig, offset = read_compact_size_item(raw, offset)
         sequence = int.from_bytes(raw[offset:offset + 4], "little")
@@ -1005,7 +1132,7 @@ def parse_transaction(raw):
         offset += 8
         script_pubkey, offset = read_compact_size_item(raw, offset)
         outputs.append(TxOutput(value, script_pubkey))
-    # Witness data after output but before locktime (BIP144)
+    # the witness data goes after the outputs and before the locktime (BIP144)
     if marker is not None:
         for item in inputs:
             element_count, offset = read_compact_size(raw, offset)
@@ -1017,11 +1144,11 @@ def parse_transaction(raw):
     locktime = int.from_bytes(raw[offset:offset + 4], "little")
     offset += 4
     if offset != len(raw):
-        raise ValueError("There are extra bytes at the end of the transaction data")
+        raise ValueError("there are extra bytes at the end of the transaction data")
     return Transaction(version, inputs, outputs, locktime)
 
 
-#================= Signature Hash Type =================
+# ================= Signature hash types =================
 SIGHASH_ALL = 0x01
 SIGHASH_NONE = 0x02
 SIGHASH_SINGLE = 0x03
@@ -1037,19 +1164,19 @@ def sighash_is_anyonecanpay(hash_type):
     return bool(hash_type & SIGHASH_ANYONECANPAY)
 
 
-#================= BIP143: Native SegWit (P2WSH / P2WPKH) signed hashes =================
+# ================= BIP143: native SegWit (P2WSH / P2WPKH) signature hash =================
 def bip143_sighash(tx, input_index, script_code, amount, hash_type=SIGHASH_ALL):
-    """BIP143 Compute signature hashes for native SegWit inputs.
+    """BIP143 computes the signature hash of a native SegWit input.
 
-script_code for P2WSH is witnessScript itself (without length prefix,
-compact_size is added when serialized into preimage), which is different from P2SH-P2WSH.
+    For P2WSH the script_code is the witnessScript itself (no length prefix in front,
+    the compact_size is only added when serializing it into the preimage); that differs from P2SH-P2WSH.
     """
     base_type = sighash_base_type(hash_type)
     anyone_can_pay = sighash_is_anyonecanpay(hash_type)
     anyone_or_none = anyone_can_pay or base_type in (SIGHASH_NONE, SIGHASH_SINGLE)
 
-    # Note: Do not use the sentinel value of the old algorithm \"0x01 is returned when the input sequence number exceeds the output number\".
-    # BIP143 explicitly requires hashOutputs to be set to 32 zeros at this time, the semantics remain the same but the hashes are different.
+    # Mind this: do not keep the old algorithm's 0x01 sentinel for "input index beyond the number of outputs".
+    # BIP143 explicitly requires hashOutputs to be 32 zero bytes then; the meaning is unchanged but the hash differs.
     if anyone_can_pay:
         hash_prevouts = b"\x00" * 32
     else:
@@ -1058,8 +1185,8 @@ compact_size is added when serialized into preimage), which is different from P2
                      else double_sha256(b"".join(item.sequence.to_bytes(4, "little")
                                                  for item in tx.inputs)))
 
-    # hashOutputs is determined only by base_type and has nothing to do with ANYONECANPAY:
-    # Neither SINGLE nor NONE -> output all; SINGLE and the sequence number is within the range -> output the same sequence number; the rest are 0.
+    # hashOutputs is decided by base_type alone and has nothing to do with ANYONECANPAY:
+    # neither SINGLE nor NONE -> all outputs; SINGLE with the index in range -> the output with the same index; otherwise 0.
     if base_type == SIGHASH_SINGLE:
         hash_outputs = (double_sha256(tx.outputs[input_index].serialize())
                         if input_index < len(tx.outputs) else b"\x00" * 32)
@@ -1080,17 +1207,17 @@ compact_size is added when serialized into preimage), which is different from P2
     return double_sha256(preimage)
 
 
-#================= BIP341: Taproot Signature Hash =================
+# ================= BIP341: Taproot signature hash =================
 def taproot_sighash(tx, input_index, prevout_scripts, prevout_amounts, hash_type=SIGHASH_DEFAULT,
                     ext_flag=0, annex=None, script=None, leaf_version=LEAF_TAPSCRIPT,
                     codeseparator_pos=0xFFFFFFFF):
     """BIP341 SigMsg -> TapSighash.
 
-prevout_scripts / prevout_amounts must be all input scriptPubKey and amounts,
-Because even with ANYONECANPAY, Taproot hashes all of this information entered together.
+    prevout_scripts / prevout_amounts must hold the scriptPubKey and amount of every input,
+    because even with ANYONECANPAY, Taproot hashes that information for all inputs together.
     """
     if len(prevout_scripts) != len(tx.inputs) or len(prevout_amounts) != len(tx.inputs):
-        raise ValueError("A scriptPubKey and amount must be provided for each input")
+        raise ValueError("the scriptPubKey and amount of every input are required")
     base_type = hash_type & 0x03
     anyone_can_pay = sighash_is_anyonecanpay(hash_type)
 
@@ -1108,12 +1235,12 @@ Because even with ANYONECANPAY, Taproot hashes all of this information entered t
     message = bytes([hash_type & 0xFF])
     message += tx.version.to_bytes(4, "little")
     message += tx.locktime.to_bytes(4, "little")
-    # When not ANYONECANPAY, these four hashes immediately follow nLockTime (BIP341 SigMsg order)
+    # without ANYONECANPAY these four hashes follow nLockTime immediately (BIP341 SigMsg order)
     if not anyone_can_pay:
         message += sha_prevouts + sha_amounts + sha_scriptpubkeys + sha_sequences
 
-    # BIP341: When hash_type & 3 is NONE or SINGLE, sha_outputs is **entirely omitted**,
-    # Instead of filling in 32 zeros. Padding with zeros results in a completely different hash.
+    # BIP341: when hash_type & 3 is NONE or SINGLE, sha_outputs is **omitted entirely**,
+    # not filled with 32 zero bytes. Filling in zeros yields a completely different hash.
     if base_type not in (SIGHASH_NONE, SIGHASH_SINGLE):
         message += sha256(b"".join(item.serialize() for item in tx.outputs))
 
@@ -1131,12 +1258,12 @@ Because even with ANYONECANPAY, Taproot hashes all of this information entered t
         message += sha256(compact_size(len(annex)) + annex)
     if base_type == SIGHASH_SINGLE:
         if input_index >= len(tx.outputs):
-            raise ValueError("SIGHASH_SINGLE When the input sequence number exceeds the output quantity")
+            raise ValueError("with SIGHASH_SINGLE the input index is beyond the number of outputs")
         message += sha256(tx.outputs[input_index].serialize())
-    # BIP342 script-path extension: if script is given, it must be connected
-    # tapleaf_hash(32) || key_version(1) || codesep_pos(4, little endian).
-    # Note that codesep_pos is **fixed 4 bytes** and will be written as 0xffffffff when OP_CODESEPARATOR has not been executed.
-    # Not omitted - leaving out those 37 bytes would result in a completely different hash.
+    # the BIP342 script-path extension: when a script is given it must be appended
+    # tapleaf_hash(32) || key_version(1) || codesep_pos(4, little-endian).
+    # Note codesep_pos is a **fixed 4 bytes**; when OP_CODESEPARATOR never ran it is 0xffffffff,
+    # not omitted -- dropping these 37 bytes yields a completely different hash.
     if script is not None:
         message += tapleaf_hash(script, leaf_version)
         message += b"\x00"
@@ -1144,34 +1271,34 @@ Because even with ANYONECANPAY, Taproot hashes all of this information entered t
     return tagged_hash("TapSighash", b"\x00" + message)
 
 
-#================= ECDSA (for bc1q multi-signature) =================
+# ================= ECDSA (used by bc1q multisig) =================
 def parse_der_signature(der):
-    """Parses a DER-encoded signature, returning (r, s). Format: 30 <len> 02 <len> r 02 <len> s."""
+    """Parse a DER-encoded signature; returns (r, s). Format: 30 <len> 02 <len> r 02 <len> s."""
     if len(der) < 8 or der[0] != 0x30:
-        raise ValueError("Not a DER signature (first byte should be 0x30)")
+        raise ValueError("not a DER signature (the first byte should be 0x30)")
     if der[1] != len(der) - 2:
-        raise ValueError("The total length of DER does not match")
+        raise ValueError("the DER total length does not match")
     if der[2] != 0x02:
-        raise ValueError("Missing r tag in DER")
+        raise ValueError("the r marker is missing from the DER")
     r_length = der[3]
     r_start = 4
     r_end = r_start + r_length
     if der[r_end] != 0x02:
-        raise ValueError("Missing s tag in DER")
+        raise ValueError("the s marker is missing from the DER")
     s_length = der[r_end + 1]
     s_value = der[r_end + 2:r_end + 2 + s_length]
     if r_end + 2 + s_length != len(der):
-        raise ValueError("DER has extra data at the end")
+        raise ValueError("there is extra data at the end of the DER")
     return int.from_bytes(der[r_start:r_end], "big"), int.from_bytes(s_value, "big")
 
 
 def point_negate(point):
-    """The curve point is inverted (x, -y)."""
+    """Negate a curve point (x, -y)."""
     return point[0], (PRIME - point[1]) % PRIME
 
 
 def scalar_multiply(point, scalar):
-    """Universal scalar multiplication, point is None to indicate a point at infinity."""
+    """Generic scalar multiplication; point = None means the point at infinity."""
     scalar %= ORDER
     result = None
     addend = point
@@ -1184,7 +1311,7 @@ def scalar_multiply(point, scalar):
 
 
 def ecdsa_verify(message_hash, der_signature, pubkey):
-    """Built-in ECDSA signature verification, returns True / False."""
+    """Built-in ECDSA verification; returns True / False."""
     try:
         r, s = parse_der_signature(der_signature)
     except ValueError:
@@ -1194,37 +1321,37 @@ def ecdsa_verify(message_hash, der_signature, pubkey):
     compressed = pubkey_to_compressed(pubkey)
     if not is_valid_pubkey(compressed):
         return False
-    # lift_x only gives points with even numbers y; if the odd or even prefix is wrong, it will be inverted to get the real y
+    # lift_x only returns the point with even y; when the parity prefix does not match, negate to get the real y
     target = lift_x(compressed[1:])
     if (2 + (target[1] & 1)) != compressed[0]:
         target = point_negate(target)
     value = int.from_bytes(message_hash, "big") % ORDER
     inverse = pow(s, ORDER - 2, ORDER)
-    combined = point_add(_base_multiply(value * inverse % ORDER),
+    combined = point_add(scalar_multiply_base_point(value * inverse % ORDER),
                          scalar_multiply(target, r * inverse % ORDER))
     if combined is None:
         return False
     return combined[0] % ORDER == r
 
 
-def _base_multiply(scalar):
-    """Scalar times base point G."""
+def scalar_multiply_base_point(scalar):
+    """Scalar multiplication of the base point G."""
     return secret_to_point(scalar)
 
 
-#================= Schnorr / BIP340 (for bc1p) =================
+# ================= Schnorr / BIP340 (used by bc1p) =================
 BASE_POINT = (BASE_X, BASE_Y)
 
 
 def schnorr_sign(message32, secret, aux_rand32=None):
-    """BIP340 Schnorr signature, for self-checking and testing purposes only."""
+    """BIP340 Schnorr signing, for the self-test and for testing only."""
     if len(message32) != 32:
-        raise ValueError("Message hash must be 32 bytes")
+        raise ValueError("the message hash must be 32 bytes")
     if aux_rand32 is not None and len(aux_rand32) != 32:
         raise ValueError("aux_rand must be 32 bytes")
     point = secret_to_point(secret)
     xonly = point[0].to_bytes(32, "big")
-    # If y is an odd number, invert the private key to ensure that the d used corresponds to an even number y.
+    # if y is odd, negate the private key so the d used corresponds to an even y
     adjusted = secret if not point[1] & 1 else ORDER - secret
     padded = adjusted.to_bytes(32, "big")
     for _ in range(64):
@@ -1244,11 +1371,11 @@ def schnorr_sign(message32, secret, aux_rand32=None):
                                                           % ORDER).to_bytes(32, "big")
         if schnorr_verify(message32, xonly, signature):
             return signature
-    raise ValueError("Schnorr signing failed, retried 64 times")
+    raise ValueError("Schnorr signing failed after 64 retries")
 
 
 def schnorr_verify(message32, pubkey_x32, signature64):
-    """BIP340 Schnorr signature verification, returns True / False."""
+    """BIP340 Schnorr verification; returns True / False."""
     if len(message32) != 32 or len(pubkey_x32) != 32 or len(signature64) != 64:
         return False
     try:
@@ -1270,7 +1397,7 @@ def schnorr_verify(message32, pubkey_x32, signature64):
     return recovered[0] == r
 
 
-#================= BIP32: Get member public keys from xpub (real multi-signatures are coordinated with xpub) =================
+# ================= BIP32: derive the member public keys from an xpub (real multisig setups coordinate over xpubs) =================
 XPUB_VERSIONS = {
     0x0488B21E: "xpub", 0x043587CF: "tpub",
     0x043587D3: "ypub", 0x043583FF: "upub",
@@ -1288,10 +1415,10 @@ class ExtendedKey(object):
 
 
 def parse_extended_key(text):
-    """Parse xpub/tpub."""
+    """Parse an xpub / tpub."""
     payload = base58check_decode(text.strip())
     if len(payload) != 78:
-        raise ValueError("Extended public key length is wrong, should be 78 bytes")
+        raise ValueError("wrong extended public key length; it should be 78 bytes")
     version = int.from_bytes(payload[0:4], "big")
     depth = payload[4]
     fingerprint = payload[5:9]
@@ -1299,39 +1426,39 @@ def parse_extended_key(text):
     chain_code = payload[13:45]
     pubkey = payload[45:78]
     if not is_valid_pubkey(pubkey):
-        raise ValueError("The public key in the extended public key is illegal")
+        raise ValueError("the public key inside the extended public key is invalid")
     return version, ExtendedKey(chain_code, pubkey, depth, fingerprint, child_index)
 
 
 def serialize_extended_key(key, version=0x0488B21E):
-    """Recode ExtendedKey to xpub (required for descriptor and fingerprint display)."""
+    """Re-encode an ExtendedKey into an xpub (needed for descriptors and for showing fingerprints)."""
     payload = version.to_bytes(4, "big") + bytes([key.depth]) + key.fingerprint
     payload += key.child_index.to_bytes(4, "big") + key.chain_code + key.pubkey
     return base58check_encode(payload)
 
 
 def derive_pubkey(parent, index):
-    """BIP32 public key derivation (only non-reinforced derivation is supported, multi-sign member paths are all 0/0/*)."""
+    """BIP32 public key derivation (only non-hardened derivation; multisig member paths are all 0/0/*)."""
     if index >= 0x80000000:
-        raise ValueError("This tool only supports non-hardened derived paths (/0/0/* and the like)")
+        raise ValueError("this tool only supports non-hardened derivation paths (like /0/0/*)")
     digest = hmac.new(parent.chain_code, parent.pubkey + index.to_bytes(4, "big"), hashlib.sha512).digest()
     left = int.from_bytes(digest[:32], "big")
     if left == 0 or left >= ORDER:
-        raise ValueError("The derived key is invalid")
+        raise ValueError("the derived key is invalid")
     parent_point = lift_x(parent.pubkey[1:])
     if (2 + (parent_point[1] & 1)) != parent.pubkey[0]:
         parent_point = point_negate(parent_point)
     child_point = point_add(secret_to_point(left), parent_point)
     if child_point is None:
-        raise ValueError("The derived public key is the point at infinity")
+        raise ValueError("the derived public key is the point at infinity")
     return ExtendedKey(digest[32:], bytes([2 + (child_point[1] & 1)]) + child_point[0].to_bytes(32, "big"),
                        parent.depth + 1, hash160(parent.pubkey)[:4], index)
 
 
 def pubkey_from_descriptor_path(text):
-    """Supports the writing method \"xpub.../0/0/0\".
+    """Supports the "xpub.../0/0/0" form.
 
-Returns (derived public key, root xpub, derived xpub).
+    Returns (the derived public key, the root xpub, the derived xpub).
     """
     parts = [item.strip() for item in text.strip().split("/")]
     base = parts[0]
@@ -1341,24 +1468,22 @@ Returns (derived public key, root xpub, derived xpub).
     root_xpub = serialize_extended_key(key, version)
     for item in parts[1:]:
         if item in ("", "*", "'", "*'"):
-            raise ValueError("The derived path must be hard-coded here, wildcards cannot be used.")
+            raise ValueError("the derivation path has to be spelled out here; wildcards are not allowed")
         key = derive_pubkey(key, int(item))
     return key.pubkey, root_xpub, serialize_extended_key(key, version)
-#================= Script executor (really run the script during Self-test) =================
+# ================= Script executor (the self-test really runs the scripts) =================
+# OP_CHECKSIG / OP_CHECKSIGVERIFY / OP_CHECKMULTISIG are already defined with the script primitives above
 OP_0 = 0x00
 OP_PUSHDATA1 = 0x4C
 OP_PUSHDATA2 = 0x4D
 OP_PUSHDATA4 = 0x4E
 OP_1 = 0x51
 OP_16 = 0x60
-OP_CHECKSIG = 0xAC
-OP_CHECKSIGVERIFY = 0xAD
-OP_CHECKMULTISIG = 0xAE
 OP_CODESEPARATOR = 0xAB
 
 
 def parse_script_ops(script):
-    """Split the script into [(type, value)], with type being \"data\" or \"op\"."""
+    """Split a script into [(kind, value)]; kind is "data" or "op"."""
     ops = []
     offset = 0
     while offset < len(script):
@@ -1379,45 +1504,45 @@ def parse_script_ops(script):
 
 
 def push_script_number(stack, number):
-    """OP_0..OP_16 is pushed onto the stack: 0 pushes a null byte, 1~16 pushes a single byte."""
+    """Push OP_0..OP_16: 0 pushes empty bytes, 1 to 16 push a single byte."""
     if number == 0:
         stack.append(b"")
     elif 1 <= number <= 16:
         stack.append(bytes([number]))
     else:
-        raise ValueError("Script number %d exceeds OP_0..OP_16" % number)
+        raise ValueError("script number %d is outside OP_0..OP_16" % number)
 
 
 def push_opcode_number(stack, opcode):
-    """Translate the **opcode** of OP_0 / OP_1..OP_16 into the number it represents and then push it onto the stack.
+    """Translate the **opcode** OP_0 / OP_1..OP_16 into the number it stands for, then push it.
 
-Opcodes and numbers are not the same thing: the opcode for OP_2 is 0x52, but the number it represents is 2.
-Directly pushing the opcode byte onto the stack as a number will cause the subsequent pop_script_number to read 82.
-Then all OP_CHECKMULTISIG scripts will fail to execute.
+    An opcode and a number are not the same thing: the opcode of OP_2 is 0x52, but the number it stands for is 2.
+    Pushing the opcode byte as if it were the number makes pop_script_number read 82 later,
+    so every OP_CHECKMULTISIG script ends up failing.
     """
     if opcode == OP_0:
         push_script_number(stack, 0)
     elif OP_1 <= opcode <= OP_16:
         push_script_number(stack, opcode - OP_1 + 1)
     else:
-        raise ValueError("Opcode 0x%02x is not OP_0..OP_16" % opcode)
+        raise ValueError("opcode 0x%02x is not OP_0..OP_16" % opcode)
 
 
 def pop_script_number(stack):
-    """Take out the script number at the top of the stack."""
+    """Pop the script number off the top of the stack."""
     if not stack:
-        raise ValueError("The stack is empty and no number can be retrieved.")
+        raise ValueError("the stack is empty, no number to pop")
     raw = stack.pop()
     return 0 if not raw else int.from_bytes(raw, "little")
 
 
 def run_checkmultisig(stack, verify_signature):
-    """The core matching logic of OP_CHECKMULTISIG copies the semantics of Bitcoin Core.
+    """The core matching logic of OP_CHECKMULTISIG, following Bitcoin Core semantics.
 
-Two consensus rules that are easy to violate:
-* Fails directly when the number of signatures is 0;
-* Signatures must appear in public key order, and each signature can only be paired with a public key \"no earlier than the current position\".
-You cannot skip the previous public key to sign the later one.
+    Two consensus rules that are easy to get wrong:
+      * * a signature count of zero fails immediately;
+      * * signatures must appear in public key order, and each one may only pair with a public key
+        that is not earlier than the current position; it cannot skip a key to sign a later one.
     """
     key_count = pop_script_number(stack)
     if key_count < 1 or key_count > MAX_MULTISIG_KEYS:
@@ -1431,7 +1556,7 @@ You cannot skip the previous public key to sign the later one.
     if len(stack) < sig_count:
         return False
     signatures = [stack.pop() for _ in range(sig_count)]
-    keys.reverse()                     # The stack is last in, first out, and conversely is the writing order in the script.
+    keys.reverse()                     # the stack is LIFO, so reversing gives the script order
     signatures.reverse()
     position = 0
     for signature in signatures:
@@ -1448,22 +1573,22 @@ You cannot skip the previous public key to sign the later one.
 
 
 def run_checksig(stack, verify_signature, require_nonempty):
-    """OP_CHECKSIG: The top of the stack is the public key, and the bottom is the signature. Return the signature verification result (the caller decides whether to push it onto the stack)."""
+    """OP_CHECKSIG: the public key is on top, the signature below it. Returns the verification result (the caller decides whether to push it)."""
     if len(stack) < 2:
         return False
     pubkey = stack.pop()
     signature = stack.pop()
     if not signature:
-        # Empty signatures are only accepted by CHECKSIGVERIFY (anyone can spend it); ordinary CHECKSIG is not accepted.
+        # an empty signature is only accepted by CHECKSIGVERIFY (anyone-can-spend); plain CHECKSIG rejects it.
         return not require_nonempty
     return bool(verify_signature(signature, pubkey))
 
 
 def execute_multisig_script(script, stack, verify_signature):
-    """Execute OP_m <keys> OP_n OP_CHECKMULTISIG this subset."""
+    """Execute the OP_m <keys> OP_n OP_CHECKMULTISIG subset."""
     if not stack:
         return False
-    stack.pop(0)                       # OP_CHECKMULTISIG requires an empty placeholder element at the bottom of the stack
+    stack.pop(0)                       # OP_CHECKMULTISIG requires a dummy element at the bottom of the stack
     for kind, value in parse_script_ops(script):
         if kind == "data":
             stack.append(value)
@@ -1472,20 +1597,20 @@ def execute_multisig_script(script, stack, verify_signature):
         elif value == OP_CHECKMULTISIG:
             if not run_checkmultisig(stack, verify_signature):
                 return False
-            # The operation result of CHECKMULTISIG should be left on the top of the stack, and then it should be the only one left on the verification stack.
-            #\"It's the only one left\" is a consensus requirement: if there are not enough signatures (there are things left in the stack) or too many signatures, it will fail.
+            # the result of CHECKMULTISIG must be left on top of the stack, then the stack must hold nothing else.
+            # "nothing else" is a consensus requirement: too few signatures (something is left) or too many both fail.
             stack.append(b"\x01")
             if len(stack) != 1 or not stack[0]:
                 return False
         elif value == OP_CODESEPARATOR:
             continue
         else:
-            return False               # No other opcodes should appear in the script generated by this tool
+            return False               # no other opcode should show up in the scripts this tool generates
     return len(stack) == 1 and bool(stack[0])
 
 
 def execute_tapscript(script, stack, verify_signature):
-    """Execute the subset of tapscript generated by this tool: CHECKSIGVERIFY chain + end CHECKSIG."""
+    """Execute the tapscript subset this tool generates: a CHECKSIGVERIFY chain plus a trailing CHECKSIG."""
     for kind, value in parse_script_ops(script):
         if kind == "data":
             stack.append(value)
@@ -1494,11 +1619,11 @@ def execute_tapscript(script, stack, verify_signature):
         elif value in (OP_CHECKSIG, OP_CHECKSIGVERIFY):
             passed = run_checksig(stack, verify_signature, require_nonempty=True)
             if value == OP_CHECKSIGVERIFY:
-                # The operation result of the VERIFY version is not left on the stack.
+                # the VERIFY variant leaves no result on the stack
                 if not passed:
                     return False
             else:
-                # The result of the normal CHECKSIG operation must be left on the top of the stack
+                # the result of plain CHECKSIG must be left on top of the stack
                 stack.append(b"\x01" if passed else b"")
         elif value == OP_CODESEPARATOR:
             continue
@@ -1507,7 +1632,7 @@ def execute_tapscript(script, stack, verify_signature):
     return len(stack) == 1 and bool(stack[0])
 
 
-#================= Built-in ECDSA signature (for Self-test only) =================
+# ================= Built-in ECDSA signing (self-test only) =================
 def encode_der_signature(r, s):
     """Encode (r, s) as DER: 30 <len> 02 <len> r 02 <len> s."""
     def part(value):
@@ -1520,7 +1645,7 @@ def encode_der_signature(r, s):
 
 
 def ecdsa_sign(message_hash, secret):
-    """Built-in ECDSA signature, dedicated for Self-test (please use a mature wallet or HWI for production environment)."""
+    """Built-in ECDSA signing, for the self-test only (use a mature wallet or HWI in production)."""
     value = int.from_bytes(message_hash, "big") % ORDER
     while True:
         nonce = secrets.randbelow(ORDER - 1) + 1
@@ -1530,14 +1655,14 @@ def ecdsa_sign(message_hash, secret):
         s = pow(nonce, ORDER - 2, ORDER) * (value + r * secret) % ORDER
         if s == 0:
             continue
-        if s > ORDER // 2:             # Low S (BIP62), consistent with mainstream wallets
+        if s > ORDER // 2:             # low S (BIP62), consistent with mainstream wallets
             s = ORDER - s
         return encode_der_signature(r, s)
 
 
-#================= End-to-end verification =================
+# ================= End-to-end verification =================
 def build_test_transaction():
-    """Create a transaction for self-checking: 1 input, 1 output."""
+    """Build a transaction for the self-test: 1 input, 1 output."""
     tx = Transaction(version=2, locktime=0)
     tx.inputs.append(TxInput(make_outpoint("00" * 32, 0), b"", 0xFFFFFFFD))
     tx.outputs.append(TxOutput(90_000, bytes.fromhex("0014") + hash160(b"\x00" * 20)))
@@ -1546,32 +1671,31 @@ def build_test_transaction():
 
 def verify_p2wsh_multisig(witness_script, ordered_keys, secrets_by_key, signer_count,
                           amount=100_000):
-    """Construct an m-of-n witness stack and actually execute witnessScript once.
+    """Build an m-of-n witness stack and really execute the witnessScript.
 
-signer_count determines how many people sign, and is used to confirm that \"one less signature will inevitably fail\".
+    signer_count decides how many members sign, to confirm that "one signature short always fails".
     """
     if not 1 <= signer_count <= len(ordered_keys):
-        raise ValueError("The number of signatures is illegal")
+        raise ValueError("the signer count is invalid")
     script_pubkey = p2wsh_script_pubkey(witness_script)
     tx = build_test_transaction()
     message = bip143_sighash(tx, 0, witness_script, amount, SIGHASH_ALL)
     signatures = [ecdsa_sign(message, secrets_by_key[key]) for key in ordered_keys[:signer_count]]
     for signature, key in zip(signatures, ordered_keys[:signer_count]):
         if not ecdsa_verify(message, signature, key):
-            return False, "The %d signature cannot be verified" % (signer_count)
+            return False, "signature number %d does not verify" % (signer_count)
     ok = execute_multisig_script(witness_script, [b""] + signatures,
                                  lambda sig, pk: ecdsa_verify(message, sig, pk))
-    label = "%d/%d member signatures" % (signer_count, len(ordered_keys))
-    return ok, (label + ": Script judgment passed" if ok else label + ": Script judgment failed")
+    return ok, ("the script says pass" if ok else "the script says fail")
 
 
 def verify_taproot_script_path(leaf_script, signatures, amount=100_000,
                                 hash_type=SIGHASH_DEFAULT):
-    """The script path to verify bc1p costs: control block -> merkle proof -> output public key -> signature one by one.
+    """Verify a bc1p script-path spend: control block -> merkle proof -> output key -> signature by signature.
 
-Only single leaf + CHECKSIG chains are supported, which is the N-of-N structure that BIP341 can really enforce:
-The script path can only prove one leaf at a time, and multiple leaves can only be used to lock \"mutually exclusive alternative scripts\".
-It cannot be used to require multiple people to sign at the same time.
+    Only the single-leaf + CHECKSIG chain form is supported; that is the N-of-N structure BIP341 can really enforce:
+    a script-path spend can only prove one leaf at a time, and several leaves can only lock in "mutually exclusive alternative scripts",
+    they cannot be used to require several people to sign together.
     """
     script_pubkey = taproot_script_pubkey(NUMS_X, tapleaf_hash(leaf_script))
     control = taproot_control_block([], taproot_output_point(NUMS_X, tapleaf_hash(leaf_script)))
@@ -1579,32 +1703,31 @@ It cannot be used to require multiple people to sign at the same time.
     prevout_scripts = [script_pubkey]
     prevout_amounts = [amount]
 
-    #1) From the verifier's perspective, only scriptPubKey, control block and merkle path are known.
-    # Recalculate the merkle root, output public key and parity bit, which must be exactly the same as scriptPubKey.
+    # 1) From the verifier point of view all it knows is the scriptPubKey, the control block and the merkle path,
+    #    it recomputes the merkle root, the output key and the parity, which must match the scriptPubKey exactly.
     leaf_version = control[0] & 0xFE
-    parity = control[0] & 1          # The parity bit is in the lowest bit of byte 0, not in control[1]
+    parity = control[0] & 1          # the parity is the lowest bit of byte 0, not of control[1]
     merkle_path = [control[33 + 32 * i:65 + 32 * i] for i in range((len(control) - 33) // 32)]
     rebuilt_root = tapleaf_hash(leaf_script, leaf_version)
     for sibling in merkle_path:
         rebuilt_root = tapbranch_hash(rebuilt_root, sibling)
     if rebuilt_root != tapleaf_hash(leaf_script, leaf_version):
-        return False, "merkle proved wrong"
+        return False, "the merkle proof does not match"
     rebuilt_point = taproot_output_point(NUMS_X, rebuilt_root)
     if rebuilt_point[1] & 1 != parity:
-        return False, "The parity bits of the output public key recorded in the control block do not match."
+        return False, "the output key parity recorded in the control block does not match"
     if rebuilt_point[0].to_bytes(32, "big") != script_pubkey[2:]:
-        return False, "The recalculated output public key is inconsistent with scriptPubKey"
+        return False, "the recomputed output key does not match the scriptPubKey"
 
-    #2) Sign one by one. The witness stack is in reverse order: the top of the stack is the signature of the last member.
+    # 2) Verify the signatures one by one. The witness stack is reversed: the top holds the last member signature.
     def check(signature, pubkey_x32):
         message = taproot_sighash(tx, 0, prevout_scripts, prevout_amounts, hash_type,
                                   ext_flag=1, script=leaf_script, leaf_version=leaf_version)
         return schnorr_verify(message, pubkey_x32, signature)
 
     ok = execute_tapscript(leaf_script, list(signatures), check)
-    label = "%d member signatures" % len(signatures)
-    return ok, (label + ": tapscript passed" if ok else label + ":tapscript judgment failed")
-#================= Member Analysis =================
+    return ok, ("the tapscript says pass" if ok else "the tapscript says fail")
+# ================= Member parsing =================
 def is_hex_text(text):
     if not text or len(text) % 2:
         return False
@@ -1616,7 +1739,7 @@ def is_hex_text(text):
 
 
 def make_member(pubkey, secret=None, xpub=None, source="", descriptor_key=None):
-    """Unify membership records. pubkey must be a 33-byte compressed public key."""
+    """Normalize a member record. pubkey is always a 33-byte compressed public key."""
     return {
         "pubkey": pubkey,
         "secret": secret,
@@ -1628,31 +1751,31 @@ def make_member(pubkey, secret=None, xpub=None, source="", descriptor_key=None):
 
 
 def parse_member(text):
-    """Parse a line of member input.
+    """Parse one line of member input.
 
-Support: WIF private key / 64-bit hexadecimal private key / decimal private key /
-33-byte compressed public key / 65-byte uncompressed public key /
-x: prefixed 32-byte x-only public key /
-xpub derived path (xpub.../0/0/0)
+    Supported: WIF private key / 64-hex-digit private key / decimal private key /
+          33-byte compressed public key / 65-byte uncompressed public key /
+          x:-prefixed 32-byte x-only public key /
+          xpub derivation path (xpub.../0/0/0)
     """
     cleaned = text.strip()
     if not cleaned:
-        raise ValueError("This line is empty")
+        raise ValueError("this line is empty")
     lowered = cleaned.lower()
 
     if lowered.startswith("x:") or lowered.startswith("xonly:"):
         body = cleaned.split(":", 1)[1].strip()
         if not is_hex_text(body) or len(body) != 64:
-            raise ValueError("x: must be followed by 64-digit hexadecimal (x-only public key)")
+            raise ValueError("after x: there must be 64 hex digits (an x-only public key)")
         data = bytes.fromhex(body)
         if not is_valid_pubkey(data):
-            raise ValueError("This is not a valid x-only public key")
+            raise ValueError("this is not a valid x-only public key")
         return make_member(pubkey_to_compressed(data), None, None, cleaned)
 
     if "/" in cleaned and cleaned[:4].lower() in ("xpub", "tpub"):
         derived = pubkey_from_descriptor_path(cleaned)
         if derived is None:
-            raise ValueError("The extended public key path is written incorrectly")
+            raise ValueError("the extended public key path is malformed")
         pubkey, root_xpub, _ = derived
         head, _, _ = cleaned.rpartition("/")
         return make_member(pubkey, None, root_xpub, cleaned, head + "/*")
@@ -1662,13 +1785,13 @@ xpub derived path (xpub.../0/0/0)
         if is_valid_pubkey(data):
             return make_member(pubkey_to_compressed(data), None, None, cleaned)
 
-    # Reuse V1's parse_secret, which returns (private key integer, whether to compress) tuple
+    # reuse parse_secret from V1; it returns the (private key integer, is_compressed) pair
     secret, _compressed = parse_secret(cleaned)
     return make_member(compressed_pubkey(secret), secret, None, cleaned)
 
 
 def parse_members(text, allow_blank=False):
-    """Multi-line input -> member list. Empty lines will be skipped (convenient for pasting lists with empty lines directly)."""
+    """Multiple lines of input -> a list of members. Blank lines are skipped (handy when pasting a list that has blanks)."""
     members = []
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip() and allow_blank:
@@ -1678,12 +1801,12 @@ def parse_members(text, allow_blank=False):
         try:
             members.append(parse_member(line))
         except ValueError as error:
-            raise ValueError("Problem at line %d: %s" % (number, error))
+            raise ValueError("line %d has a problem: %s" % (number, error))
     if not members:
-        raise ValueError("No members read")
+        raise ValueError("no members were read")
     fingerprints = [item["fingerprint"] for item in members]
     if len(set(fingerprints)) != len(fingerprints):
-        raise ValueError("There are duplicate members (same fingerprints), please check the list")
+        raise ValueError("duplicate members (same fingerprint), please check the list")
     return members
 
 
@@ -1698,12 +1821,12 @@ def random_members(count):
     return members
 
 
-#================= Solution construction =================
+# ================= Scheme construction =================
 def build_p2wsh_scheme(members, threshold, order="bip67"):
-    """Building an m-of-n multi-signature scheme for bc1q."""
+    """Build the bc1q m-of-n multisig scheme."""
     pubkeys = [item["pubkey"] for item in members]
     if len(set(pubkeys)) != len(pubkeys):
-        raise ValueError("There are duplicate member public keys")
+        raise ValueError("duplicate member public keys")
     if order == "fingerprint":
         ordered = sort_keys_by_fingerprint(pubkeys)
     else:
@@ -1714,7 +1837,7 @@ def build_p2wsh_scheme(members, threshold, order="bip67"):
         threshold, ",".join(keys_by_pubkey[key]["descriptor_key"] for key in ordered))
     return {
         "type": "p2wsh",
-        "label": "Native SegWit multi-signature",
+        "label": "native SegWit multisig",
         "threshold": threshold,
         "members": len(ordered),
         "keys": ordered,
@@ -1723,17 +1846,17 @@ def build_p2wsh_scheme(members, threshold, order="bip67"):
         "script_pubkey": p2wsh_script_pubkey(witness_script),
         "address": p2wsh_address(witness_script),
         "descriptor": descriptor,
-        "note": "Once the member set is changed, the address will change, and the payment address must be re-appointed.",
+        "note": "Once the member set changes the address changes, so the receiving address has to be agreed again.",
     }
 
 
 def build_taproot_scheme(members, layout="chain"):
-    """Construct bc1p's full signature scheme."""
+    """Build the bc1p everyone-signs scheme."""
     xonly = [pubkey_to_xonly(item["pubkey"]) for item in members]
     plan = build_taproot_plan(xonly, layout)
     keys_by_xonly = {pubkey_to_xonly(item["pubkey"]): item for item in members}
     if layout == "chain":
-        # and_v(v:pk(k1),and_v(v:pk(k2),...)) —— One-to-one correspondence with the CHECKSIGVERIFY chain
+        # and_v(v:pk(k1),and_v(v:pk(k2),...)) -- one and_v per CHECKSIGVERIFY link
         parts = ["v:pk(%s)" % keys_by_xonly[key]["descriptor_key"] for key in plan["keys"]]
         tree = parts[-1]
         for item in reversed(parts[:-1]):
@@ -1744,7 +1867,7 @@ def build_taproot_scheme(members, layout="chain"):
     descriptor = "tr(%s,%s)" % (NUMS_X.hex(), tree)
     return {
         "type": "p2tr",
-        "label": "Signed by all members of Taproot",
+        "label": "Taproot everyone signs",
         "threshold": len(plan["keys"]),
         "members": len(plan["keys"]),
         "keys": plan["keys"],
@@ -1759,11 +1882,11 @@ def build_taproot_scheme(members, layout="chain"):
         "script_pubkey": plan["script_pubkey"],
         "address": segwit_encode(MAINNET["hrp"], 1, plan["output_key"]),
         "descriptor": descriptor,
-        "note": "Taproot does not have OP_CHECKMULTISIG. The signature of all members relies on a CHECKSIG chain, even if one is missing.",
+        "note": "Taproot has no OP_CHECKMULTISIG; everyone signing relies on one CHECKSIG chain, with no signature left out.",
     }
 
 
-#================= Descriptor Checksum (# xxxxxxxx for BIP380) =================
+# ================= Descriptor checksum (the #xxxxxxxx of BIP380) =================
 DESCRIPTOR_INPUT_CHARSET = ("0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~"
                             "ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ")
 DESCRIPTOR_CHECKSUM_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -1788,7 +1911,7 @@ def descriptor_expand(text):
     symbols = []
     for character in text:
         if character not in DESCRIPTOR_INPUT_CHARSET:
-            raise ValueError("Illegal characters in descriptor: %r" % character)
+            raise ValueError("the descriptor contains an illegal character: %r" % character)
         value = DESCRIPTOR_INPUT_CHARSET.index(character)
         symbols.append(value & 31)
         groups.append(value >> 5)
@@ -1803,10 +1926,10 @@ def descriptor_expand(text):
 
 
 def descriptor_checksum(text):
-    """Calculates the BIP380 descriptor checksum and returns 8 characters (excluding #).
+    """Compute the BIP380 descriptor checksum; returns 8 characters (without the #).
 
-Note that 8 0s should be added at the end and then XORed with 1. This is the practice of BIP380 reference implementation;
-Just padding with 1 zero will give you an incorrect checksum (the correct value of the official vector raw(deadbeef) is 89f8spxm).
+    note that 8 zeros are appended at the end and then XORed with 1, which is what the BIP380 reference implementation does;
+    appending only one zero gives the wrong checksum (the correct value for the official vector raw(deadbeef) is 89f8spxm).
     """
     symbols = descriptor_expand(text) + [0, 0, 0, 0, 0, 0, 0, 0]
     value = descriptor_polymod(symbols) ^ 1
@@ -1814,7 +1937,7 @@ Just padding with 1 zero will give you an incorrect checksum (the correct value 
 
 
 def descriptor_checksum_valid(text):
-    """Check in turn: the descriptor's own checksum is correct."""
+    """Check the other way round: whether the checksum carried by a descriptor is correct."""
     if text[-9:] != "#" + text[-8:] or "#" not in text:
         return False
     body, given = text[:-9], text[-8:]
@@ -1828,36 +1951,36 @@ def descriptor_with_checksum(text):
     if "#" in text:
         text = text.split("#", 1)[0]
     return text + "#" + descriptor_checksum(text)
-#================= Console and underlying gadgets =================
+# ================= Console and low-level helpers =================
 def enable_utf8_console():
-    """The Windows console outputs in UTF-8 to prevent Chinese characters from turning into question marks."""
+    """Make the Windows console print UTF-8 so that Chinese text does not turn into question marks."""
     if os.name == "nt" and ctypes is not None:
         try:
             ctypes.windll.kernel32.SetConsoleOutputCP(65001)
             ctypes.windll.kernel32.SetConsoleCP(65001)
-        except Exception:                           # A few environments do not support it, so just ignore it.
+        except Exception:                           # a few environments do not support it, so just ignore failures
             pass
 
 
-#================= Self-check =================
-# The expected value is taken from the public official vector, not calculated by me:
-# BIP32 xpub fields and roundtrips
-# BIP140/341 TapLeaf / TapBranch / merkle root / tweak / control block / output public key / address
-# BIP173 bech32 address
-# BIP340 Schnorr signature
+# ================= Self-test =================
+# The expected values come from the published official vectors, not from my own computations:
+#   BIP32   xpub fields and round trip
+#   BIP140/341  TapLeaf / TapBranch / merkle root / tweak / control block / output key / address
+#   BIP173  bech32 addresses
+#   BIP340  Schnorr signatures
 #   BIP350  bech32m
-# BIP380 descriptor checksum
+#   BIP380  descriptor checksums
 def expect_equal(name, actual, expected):
     if actual != expected:
-        raise AssertionError("%s: expected %s, actual %s" % (name, expected, actual))
+        raise AssertionError("%s: expected %s, got %s" % (name, expected, actual))
     return name
 
 
-#---------- Official vector (BIP340 Schnorr) ----------
-# Top 15 official BIP340 vectors (bip-0340/test-vectors.csv).
-# Fields: serial number, private key, public key, aux_rand, message, signature, whether the signature is verified.
-# Items 15~18 are variable-length message vectors, and schnorr of this tool only processes 32-byte messages.
-#(Taproot signature hash is always 32 bytes), so it is not included. The private key \"-\" is a vector that only verifies signatures.
+# ---------- Official vectors (BIP340 Schnorr) ----------
+# The first 15 rows of the BIP340 official vectors (bip-0340/test-vectors.csv).
+# Fields: index, secret key, public key, aux_rand, message, signature, whether it should verify.
+# Rows 15 to 18 are the variable-length message vectors, while the schnorr here only handles 32-byte messages
+# (a Taproot signature hash is always 32 bytes), so they are left out. The rows with "-" as the secret key are verify-only.
 BIP340_VECTORS = [
     ("0", "0000000000000000000000000000000000000000000000000000000000000003", "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "0000000000000000000000000000000000000000000000000000000000000000", "0000000000000000000000000000000000000000000000000000000000000000", "e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0", True),
     ("1", "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef", "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659", "0000000000000000000000000000000000000000000000000000000000000001", "243f6a8885a308d313198a2e03707344a4093822299f31d0082efa98ec4e6c89", "6896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de33418906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a", True),
@@ -1884,10 +2007,10 @@ def register_checks(check):
     register_official_sighash_checks(check)
 
 
-#---------- Low-level primitives ----------
+# ---------- Low-level primitives ----------
 def register_primitive_checks(check):
     def bech32_p2wpkh():
-        # BIP173 official vector
+        # BIP173 official vectors
         key = bytes.fromhex("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
         address = segwit_encode("bc", 0, hash160(key))
         expect_equal("BIP173 P2WPKH address", address,
@@ -1895,7 +2018,7 @@ def register_primitive_checks(check):
         return address
 
     def bech32m_p2tr():
-        # Witness version 1 must use bech32m; the program is taken from the BIP341 official vector, and the address is also official
+        # witness version 1 must use bech32m; the program comes from the official BIP341 vectors and so does the address
         program = bytes.fromhex("53a1f6e454df1aa2776a2814a721372d6258050de330b3c6d10ee8f4e0dda343")
         address = segwit_encode("bc", 1, program)
         expect_equal("BIP350 Taproot address", address,
@@ -1903,39 +2026,39 @@ def register_primitive_checks(check):
         return address
 
     def bech32_version_binding():
-        """The witness version and checksum algorithm must be bound: v0 can only bech32, v1~v16 can only bech32m.
+        """The witness version and the checksum algorithm must be bound together: v0 can only be bech32, v1 to v16 only bech32m.
 
-Note that BIP350 explicitly recommends that the **decoder** try two checksums at the same time (the wallet must be compatible),
-So \"the decoder rejects the corresponding version\" is not a correct behavior; what is checked here is the binding of the encoding side,
-In addition, the decoding end must be able to identify the version and witness program, and must report an error when the checksum is changed.
+        Note that BIP350 explicitly recommends that the **decoding** side try both checksums (a wallet has to be compatible),
+        so "the decoder rejects the matching version" is not the right behaviour; what is checked here is the binding on the **encoding** side,
+        plus that the decoding side can recover the version and the witness program, and that a tampered checksum must be an error.
         """
         v1_program = bytes.fromhex("53a1f6e454df1aa2776a2814a721372d6258050de330b3c6d10ee8f4e0dda343")
         v0_program = bytes.fromhex("751e76e8199196d454941c45d1b3a323f1433bd6")
         good = segwit_encode("bc", 1, v1_program)
-        # Encoding side: v0 -> bech32(q), v1 -> bech32m(p)
+        # encoding side: v0 -> bech32 (q), v1 -> bech32m (p)
         expect_equal("v0 encoding prefix", segwit_encode("bc", 0, v0_program)[:4], "bc1q")
         expect_equal("v1 encoding prefix", segwit_encode("bc", 1, v1_program)[:4], "bc1p")
-        # Decoding end: The version and witness program must be restored correctly
+        # decoding side: the version and the witness program must come back correctly
         hrp, version, program = segwit_decode(segwit_encode("bc", 1, v1_program))
-        expect_equal("Decode hrp", hrp, "bc")
-        expect_equal("Decode witness version", version, 1)
-        expect_equal("decoding witness program", program.hex(), v1_program.hex())
-        # The checksum has been changed -> must not be solved (the convention is to return None, not throw an exception)
+        expect_equal("decoded hrp", hrp, "bc")
+        expect_equal("decoded witness version", version, 1)
+        expect_equal("decoded witness program", program.hex(), v1_program.hex())
+        # a tampered checksum -> it must not decode (by convention return None, do not raise)
         broken = "bc1p2wsldez5mud2yam29q22wgfh9439spgduvct83k3pm50fcxa5dps59h4z6"
         if segwit_decode(broken) is not None:
-            raise AssertionError("Even after changing the checksum, I can still figure it out.")
-        # Addresses with incorrect length must also be rejected
+            raise AssertionError("a tampered checksum still decoded")
+        # an address of the wrong length must also be rejected
         if segwit_decode(good[:40]) is not None:
-            raise AssertionError("The truncated address can still be solved")
-        return "The encoder binds the version correctly; the decoder rejects malformed checksums."
+            raise AssertionError("a truncated address still decoded")
+        return "the encoding side binds the version correctly, the decoding side recovers it and rejects a bad checksum"
 
     def tagged_hash_domain():
-        expect_equal("tagged_hash with field separation",
+        expect_equal("tagged_hash with a domain separator",
                      tagged_hash("TapLeaf", b"").hex(),
                      sha256(sha256(b"TapLeaf") + sha256(b"TapLeaf")).hex())
-        expect_equal("Different tags have different results",
+        expect_equal("a different tag gives a different result",
                      tagged_hash("TapLeaf", b"") == tagged_hash("TapBranch", b""), False)
-        return "Domain separation is correct"
+        return "the domain separation is correct"
 
     def schnorr_roundtrip():
         secret = 0x1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF
@@ -1943,17 +2066,17 @@ In addition, the decoding end must be able to identify the version and witness p
         message = sha256(b"bitcoin multisig selftest")
         signature = schnorr_sign(message, secret, b"\x00" * 32)
         if not schnorr_verify(message, xonly, signature):
-            raise AssertionError("I can't even verify the signature I signed.")
+            raise AssertionError("a signature we produced ourselves does not verify")
         broken = signature[:-1] + bytes([signature[-1] ^ 1])
         if schnorr_verify(message, xonly, broken):
-            raise AssertionError("Even if I change one byte, it still passes.")
+            raise AssertionError("changing one byte still passed")
         wrong_key = pubkey_to_xonly(compressed_pubkey(secret + 1))
         if schnorr_verify(message, wrong_key, signature):
-            raise AssertionError("I can still get through changing the public key")
-        return "Signing and verification pass; tampered signatures and wrong keys are rejected."
+            raise AssertionError("swapping the public key still passed")
+        return "verification passes; tampering and a swapped key are rejected"
 
     def bip340_vectors():
-        """Check the BIP340 official vector: if it can be signed, re-sign and compare it one by one, and if it can only be signed, it will be judged one by one to pass/reject."""
+        """Check the BIP340 official vectors: re-sign every signable row and compare, and decide pass/fail on every verify-only row."""
         signed = verified = 0
         for index, secret_hex, pubkey_hex, aux_hex, msg_hex, sig_hex, should_pass in BIP340_VECTORS:
             label = "BIP340 vector %s" % index
@@ -1962,7 +2085,7 @@ In addition, the decoding end must be able to identify the version and witness p
             xonly = bytes.fromhex(pubkey_hex)
 
             got = schnorr_verify(message, xonly, signature)
-            expect_equal("%s signature verification result" % label, got, should_pass)
+            expect_equal("%s verification result" % label, got, should_pass)
             verified += 1
 
             if secret_hex == "-":
@@ -1973,7 +2096,7 @@ In addition, the decoding end must be able to identify the version and witness p
             produced = schnorr_sign(message, secret, bytes.fromhex(aux_hex))
             expect_equal("%s signature" % label, produced.hex(), sig_hex)
             signed += 1
-        return "Re-signed %d cases and verified %d; all match the official vectors." % (signed, verified)
+        return "%d re-signed and %d verified rows all match the official ones" % (signed, verified)
 
     def ecdsa_roundtrip():
         secret = 0x0BADC0DE00000000000000000000000000000000000000000000000000000001
@@ -1981,61 +2104,61 @@ In addition, the decoding end must be able to identify the version and witness p
         signature = ecdsa_sign(message, secret)
         pubkey = compressed_pubkey(secret)
         if not ecdsa_verify(message, signature, pubkey):
-            raise AssertionError("Self-signing and self-inspection failed")
+            raise AssertionError("our own signature failed our own verification")
         if ecdsa_verify(message, signature, compressed_pubkey(secret + 1)):
-            raise AssertionError("I can still get through changing the public key")
+            raise AssertionError("swapping the public key still passed")
         if ecdsa_verify(sha256(b"another message"), signature, pubkey):
-            raise AssertionError("I can still survive by changing the news")
-        return "Signing and verification pass; wrong keys and changed messages are rejected."
+            raise AssertionError("swapping the message still passed")
+        return "verification passes; a swapped key and a swapped message are rejected"
 
     def bip32_fields():
-        # Mainnet xpub of BIP32 official vector 1, field-by-field verification
+        # the mainnet xpub of official BIP32 vector 1, checked field by field
         text = ("xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJ"
                 "oCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8")
         version, key = parse_extended_key(text)
         expect_equal("xpub version bytes", version, 0x0488B21E)
         expect_equal("xpub depth", key.depth, 0)
         expect_equal("xpub fingerprint", key.fingerprint.hex(), "00000000")
-        expect_equal("xpub subindex", key.child_index, 0)
-        expect_equal("xpub chaincode", key.chain_code.hex(),
+        expect_equal("xpub child index", key.child_index, 0)
+        expect_equal("xpub chain code", key.chain_code.hex(),
                      "873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d508")
         expect_equal("xpub public key", key.pubkey.hex(),
                      "0339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2")
-        expect_equal("xpub round trip consistent", serialize_extended_key(key, version), text)
-        return "All fields and round-trips match the official vectors."
+        expect_equal("xpub round trip", serialize_extended_key(key, version), text)
+        return "the fields and the round trip both match the official vector"
 
     def bip32_derives():
-        # Only non-reinforced derivation is supported, so the mainnet xpub of the official vector 1 is used as the parent.
-        # The expected value is calculated independently by libsecp256k1: the master public key prefix is 03 (Y is an odd number),
-        # It just covers the pitfall of \"the parent point cannot simply use lift_x (always an even number Y)\".
+        # Only non-hardened derivation is supported, so the mainnet xpub of official vector 1 is used as the parent.
+        # The expected values are computed independently with libsecp256k1: the parent public key prefix is 03 (Y is odd),
+        # which is exactly the case that catches the trap of "the parent point cannot simply use lift_x (always even Y)".
         version, key = parse_extended_key(
             "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJ"
             "oCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8")
-        expect_equal("m/0x0/0 sub-public key", derive_pubkey(key, 0).pubkey.hex(),
+        expect_equal("m/0x0/0 child public key", derive_pubkey(key, 0).pubkey.hex(),
                      "027c4b09ffb985c298afe7e5813266cbfcb7780b480ac294b0b43dc21f2be3d13c")
-        expect_equal("m/0x0/0 sub-chain code", derive_pubkey(key, 0).chain_code.hex(),
+        expect_equal("m/0x0/0 child chain code", derive_pubkey(key, 0).chain_code.hex(),
                      "d323f1be5af39a2d2f08f5e8f664633849653dbe329802e9847cfc85f8d7b52a")
-        expect_equal("m/0x1 sub-public key", derive_pubkey(key, 1).pubkey.hex(),
+        expect_equal("m/0x1 child public key", derive_pubkey(key, 1).pubkey.hex(),
                      "037c2098fd2235660734667ff8821dbbe0e6592d43cfd86b5dde9ea7c839b93a50")
 
-        # Three levels are derived continuously, and the parent-child parity is flipped back and forth to prevent errors such as \"forcing negative values based on parent parity\".
+        # Derive three levels in a row; the parent/child parity flips back and forth, which catches errors like "just negate according to the parent parity".
         node = key
         for index in (0, 0, 2):
             node = derive_pubkey(node, index)
-        expect_equal("Continuously derive m/0x0/0x0/2 public keys", node.pubkey.hex(),
+        expect_equal("chained derivation m/0x0/0x0/2 public key", node.pubkey.hex(),
                      "02b252b9a5c5a31f07d52ef5308e4845b21b15e367abf00e8e47bcb48cbcfad2d0")
-        expect_equal("Continuously derived chaincode", node.chain_code.hex(),
+        expect_equal("chained derivation chain code", node.chain_code.hex(),
                      "0f676defcc0789bd9951f55e4d0687051ceae44f2dd0c32981da25befb05180a")
-        expect_equal("Continuously derived depth", node.depth, 3)
+        expect_equal("chained derivation depth", node.depth, 3)
 
         child = derive_pubkey(key, 0)
         if child.fingerprint != hash160(key.pubkey)[:4]:
-            raise AssertionError("The child key fingerprint should be the first 4 bytes of hash160 of the parent public key")
+            raise AssertionError("the child key fingerprint should be the first 4 bytes of hash160(parent pubkey)")
         if not is_valid_pubkey(child.pubkey):
-            raise AssertionError("Derive an illegal public key")
+            raise AssertionError("derivation produced an invalid public key")
         if serialize_extended_key(child, version).startswith("xpub") is False:
-            raise AssertionError("Wrong prefix after recoding")
-        return "Byte-for-byte consistent with libsecp256k1, including parity flips."
+            raise AssertionError("the prefix is wrong after re-encoding")
+        return "byte-for-byte identical to libsecp256k1, and parity flips are handled correctly"
 
     def bip32_hardened_rejected():
         _, key = parse_extended_key(
@@ -2044,11 +2167,11 @@ In addition, the decoding end must be able to identify the version and witness p
         try:
             derive_pubkey(key, 0x80000000)
         except ValueError:
-            return "Hardened derivations are rejected (xpubs contain public keys only)."
-        raise AssertionError("The hardening path was not rejected")
+            return "a hardened path is correctly rejected (an xpub holds no private key, so it cannot derive)"
+        raise AssertionError("a hardened path was not rejected")
 
     def descriptor_checksum_vector():
-        # BIP380 official vector
+        # BIP380 official vectors
         expect_equal("BIP380 raw(deadbeef)",
                      descriptor_with_checksum("raw(deadbeef)"), "raw(deadbeef)#89f8spxm")
         for text in ("raw(deadbeef)#89f8spxm",
@@ -2056,41 +2179,41 @@ In addition, the decoding end must be able to identify the version and witness p
                      "wsh(sortedmulti(2,xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8/0/0/*))"):
             built = descriptor_with_checksum(text)
             if not descriptor_checksum_valid(built):
-                raise AssertionError("Generated by yourself but failed to verify by yourself: %s" % built)
+                raise AssertionError("we generated it and then it failed to verify: %s" % built)
         if descriptor_checksum_valid("raw(deedbeef)#89f8spxm"):
-            raise AssertionError("The descriptor with modified content actually passed the verification")
-        return "The official vector is consistent and tampered descriptors can be detected"
+            raise AssertionError("a tampered descriptor passed the checksum")
+        return "the official vector matches, and a tampered descriptor is detected"
 
     def pubkey_validation():
         good = "0250863ad64a87ae8a2fe83c1af1a8403cb53f53e486d8511dad8a04887e5b2352"
-        expect_equal("Compressed public key is valid", is_valid_pubkey(bytes.fromhex(good)), True)
-        expect_equal("x=0 is judged as invalid", is_valid_pubkey(bytes.fromhex("02" + "00" * 32)), False)
-        expect_equal("The wrong prefix is judged to be invalid.", is_valid_pubkey(bytes.fromhex("05" + "11" * 32)), False)
+        expect_equal("a compressed public key is valid", is_valid_pubkey(bytes.fromhex(good)), True)
+        expect_equal("x=0 is judged invalid", is_valid_pubkey(bytes.fromhex("02" + "00" * 32)), False)
+        expect_equal("a wrong prefix is judged invalid", is_valid_pubkey(bytes.fromhex("05" + "11" * 32)), False)
         uncompressed = "0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" \
                        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"
-        expect_equal("Uncompressed public keys are valid", is_valid_pubkey(bytes.fromhex(uncompressed)), True)
-        return "Valid and invalid keys are classified correctly."
+        expect_equal("an uncompressed public key is valid", is_valid_pubkey(bytes.fromhex(uncompressed)), True)
+        return "valid and invalid are both judged correctly"
 
-    check("BIP173 bech32 address", bech32_p2wpkh)
-    check("BIP350 bech32m address", bech32m_p2tr)
-    check("Witness version and checksum are bound", bech32_version_binding)
+    check("BIP173 bech32 addresses", bech32_p2wpkh)
+    check("BIP350 bech32m addresses", bech32m_p2tr)
+    check("witness version bound to the checksum", bech32_version_binding)
     check("tagged_hash domain separation", tagged_hash_domain)
-    check("Schnorr signature verification", schnorr_roundtrip)
-    check("BIP340 test vectors", bip340_vectors)
-    check("ECDSA signing and verification", ecdsa_roundtrip)
-    check("BIP32 xpub field", bip32_fields)
+    check("Schnorr sign and verify", schnorr_roundtrip)
+    check("BIP340 official vectors", bip340_vectors)
+    check("ECDSA sign and verify", ecdsa_roundtrip)
+    check("BIP32 xpub fields", bip32_fields)
     check("BIP32 non-hardened derivation", bip32_derives)
-    check("Hardened derivations are rejected", bip32_hardened_rejected)
+    check("hardened paths rejected", bip32_hardened_rejected)
     check("BIP380 descriptor checksum", descriptor_checksum_vector)
-    check("Public key validity", pubkey_validation)
+    check("public key validity check", pubkey_validation)
 
 
-#---------- Official vector (BIP341 TapTree) ----------
-# Directly embed the BIP341 official vector (the scriptPubKey part of bip-0341/wallet-test-vectors.json),
-# This way the delivered file does not depend on any external data files.
-# tree maintains the official original tree shape with nested tuples: leaves are (\"l\", leaf version, script hex),
-# The branches are (\"b\", left, right). The official merkle root for [a, [b, c]] is
-# TapBranch(a, TapBranch(b, c)), after being flattened and divided according to floor, the result is another root, which does not match.
+# ---------- Official vectors (BIP341 TapTree) ----------
+# The official BIP341 vectors are embedded directly (the scriptPubKey part of bip-0341/wallet-test-vectors.json),
+# so the delivered file depends on no external data file.
+# The tree uses nested tuples to keep the official shape: a leaf is ("l", leaf version, script hex),
+# a branch is ("b", left, right). The merkle root of the official [a, [b, c]] is
+# TapBranch(a, TapBranch(b, c)); flattening it and splitting by floor gives another root, which does not match.
 BIP341_WALLET_VECTORS = [
     {
         "internal": "d6889cb081036e0faefa3a35157ad71086b123b2b144b649798b494c300a961d",
@@ -2169,7 +2292,7 @@ BIP341_WALLET_VECTORS = [
 ]
 
 def vector_leaves(node):
-    """List leaves (leaf version, script bytes) in depth-first order, in the same order as official leafHashes."""
+    """List the leaves (leaf version, script bytes) in depth-first order, matching the official leafHashes."""
     if node[0] == "l":
         return [(node[1], bytes.fromhex(node[2]))]
     return vector_leaves(node[1]) + vector_leaves(node[2])
@@ -2182,7 +2305,7 @@ def vector_tree_root(node):
 
 
 def vector_paths(node):
-    """Returns a list of side hashes from each leaf leading to the root in leaf order (from bottom to top)."""
+    """Return, in leaf order, the list of sibling hashes from each leaf up to the root (bottom-up)."""
     if node[0] == "l":
         return [[]]
     left_root = vector_tree_root(node[1])
@@ -2200,56 +2323,56 @@ def register_vector_checks(check):
         script = bytes.fromhex("20" + "11" * 32 + "ac")
         expect_equal("TapLeaf hash", tapleaf_hash(script),
                      tagged_hash("TapLeaf", b"\xc0" + b"\x22" + script))
-        return "Matches the BIP341 definition byte for byte."
+        return "byte-for-byte identical to the BIP341 definition"
 
     def tapbranch_is_order_independent():
         first, second = sha256(b"a"), sha256(b"b")
-        expect_equal("Branch hashing is order independent", tapbranch_hash(first, second),
+        expect_equal("the branch hash is order independent", tapbranch_hash(first, second),
                      tapbranch_hash(second, first))
-        return "Result is identical regardless of leaf order."
+        return "reversing the order gives the same result"
 
     def taptree_convention():
-        # The tree shape of the three leaves in the official vector is [l0, [l1, l2]], and the floor segmentation of this tool must be reproducible.
-        # Note that the leaf public key must be 32 bytes x-only, and using hash160 (20 bytes) will be rejected.
+        # In the official vector the three-leaf tree is [l0, [l1, l2]], which the floor split here has to reproduce.
+        # Note the leaf public key must be a 32-byte x-only key; a hash160 (20 bytes) is rejected.
         scripts = [tapscript_leaf_for_key(sha256(b"member%d" % index))
                    for index in range(3)]
         leaves = [tapleaf_hash(script) for script in scripts]
         root, paths = build_taptree(leaves)
         manual = tapbranch_hash(leaves[0], tapbranch_hash(leaves[1], leaves[2]))
-        expect_equal("3 leaf tree shape", root.hex(), manual.hex())
-        expect_equal("The number of side branches of leaf 0", len(paths[0]), 1)
-        expect_equal("The number of side branches of leaf 1", len(paths[1]), 2)
-        return "[l0,[l1,l2]], same shape as the official vectors."
+        expect_equal("3-leaf tree shape", root.hex(), manual.hex())
+        expect_equal("sibling count of leaf 0", len(paths[0]), 1)
+        expect_equal("sibling count of leaf 1", len(paths[1]), 2)
+        return "[l0,[l1,l2]], the same shape as the official vector"
 
     def wallet_vectors():
-        """Check the embedded BIP341 official vectors item by item."""
+        """Check every embedded official BIP341 vector."""
         counts = dict.fromkeys(["leaf", "root", "tweak", "output", "control", "spk", "address"], 0)
         for entry in BIP341_WALLET_VECTORS:
             internal_x = bytes.fromhex(entry["internal"])
             tree = entry["tree"]
             if tree is None:
-                # Pure key path: merkle root is empty, tweak only hashes the internal public key itself
-                expect_equal("Official vector key path tweak",
+                # pure key path: the merkle root is empty, the tweak hashes only the internal public key
+                expect_equal("official vector key path tweak",
                              taproot_tweak(internal_x, None).hex(), entry["tweak"])
                 output_point = taproot_output_point(internal_x, None)
-                expect_equal("Official vector key path tweakedPubkey",
+                expect_equal("official vector key path tweakedPubkey",
                              output_point[0].to_bytes(32, "big").hex(), entry["tweaked"])
             else:
                 leaves = vector_leaves(tree)
                 root = vector_tree_root(tree)
                 for position, (version, script) in enumerate(leaves):
-                    expect_equal("Official vector leafHashes",
+                    expect_equal("official vector leafHashes",
                                  tapleaf_hash(script, version).hex(),
                                  entry["leaf_hashes"][position])
                     counts["leaf"] += 1
-                expect_equal("Official vector merkleRoot", root.hex(), entry["root"])
+                expect_equal("official vector merkleRoot", root.hex(), entry["root"])
                 counts["root"] += 1
-                expect_equal("Official vector tweak", taproot_tweak(internal_x, root).hex(),
+                expect_equal("official vector tweak", taproot_tweak(internal_x, root).hex(),
                              entry["tweak"])
                 counts["tweak"] += 1
 
                 output_point = taproot_output_point(internal_x, root)
-                expect_equal("Official vector tweakedPubkey",
+                expect_equal("official vector tweakedPubkey",
                              output_point[0].to_bytes(32, "big").hex(), entry["tweaked"])
                 counts["output"] += 1
 
@@ -2260,27 +2383,27 @@ def register_vector_checks(check):
                         break
                     control = taproot_control_block(paths[position], output_point,
                                                     internal_x, version)
-                    expect_equal("Official vector control block", control.hex(), blocks[position])
+                    expect_equal("official vector control block", control.hex(), blocks[position])
                     counts["control"] += 1
 
             program = output_point[0].to_bytes(32, "big")
-            expect_equal("Official vector scriptPubKey", (b"\x51\x20" + program).hex(),
+            expect_equal("official vector scriptPubKey", (b"\x51\x20" + program).hex(),
                          entry["spk"])
             counts["spk"] += 1
-            expect_equal("Official vector bech32m address", segwit_encode("bc", 1, program),
+            expect_equal("official vector bech32m address", segwit_encode("bc", 1, program),
                          entry["addr"])
             counts["address"] += 1
-        return "%d leaves, %d roots, %d tweaks, %d outputs, %d control blocks, %d scripts, %d addresses - all matched." % (
-            counts["leaf"], counts["root"], counts["tweak"], counts["output"],
-            counts["control"], counts["spk"], counts["address"])
+        return ("%d leaves, %d roots, %d tweaks, %d output keys, %d control blocks, %d scripts and %d addresses all match"
+                % (counts["leaf"], counts["root"], counts["tweak"], counts["output"],
+                   counts["control"], counts["spk"], counts["address"]))
 
     check("TapLeaf hash algorithm", tapleaf_hash_matches_spec)
-    check("TapBranch order-independence", tapbranch_is_order_independent)
-    check("TapTree branch layout", taptree_convention)
-    check("BIP341 test vectors", wallet_vectors)
+    check("TapBranch order independence", tapbranch_is_order_independent)
+    check("TapTree split convention", taptree_convention)
+    check("BIP341 official vectors", wallet_vectors)
 
 
-#----------Multi-signature plan ----------
+# ---------- Multisig schemes ----------
 def register_multisig_checks(check):
     def witness_script_structure():
         key1 = bytes.fromhex("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
@@ -2289,7 +2412,7 @@ def register_multisig_checks(check):
         # OP_1(0x51) <push33+key1> <push33+key2> OP_2(0x52) OP_CHECKMULTISIG(0xae)
         expect_equal("witnessScript structure", script.hex(),
                      "51" + "21" + key1.hex() + "21" + key2.hex() + "52ae")
-        expect_equal("3-of-3 threshold bytes", multisig_witness_script(3, [key1, key2, key1]).hex()[:2],
+        expect_equal("the threshold byte of 3-of-3", multisig_witness_script(3, [key1, key2, key1]).hex()[:2],
                      "53")
         return "OP_m ... OP_n OP_CHECKMULTISIG"
 
@@ -2299,12 +2422,12 @@ def register_multisig_checks(check):
         secrets_by_key = {item["pubkey"]: item["secret"] for item in members}
         ordered = scheme["keys"]
         if verify_p2wsh_multisig(scheme["witness_script"], ordered, secrets_by_key, 1)[0]:
-            raise AssertionError("1 signature actually passed 2-of-3")
+            raise AssertionError("1 signature passed 2-of-3")
         if not verify_p2wsh_multisig(scheme["witness_script"], ordered, secrets_by_key, 2)[0]:
-            raise AssertionError("2 signatures that should have passed but didn't")
+            raise AssertionError("2 signatures should have passed but did not")
         if verify_p2wsh_multisig(scheme["witness_script"], ordered, secrets_by_key, 3)[0]:
-            raise AssertionError("3 signatures were rejected by 2-of-3")
-        return "2-of-3: 1 signature is rejected, 2 pass, and extra signatures are rejected."
+            raise AssertionError("2-of-3 rejected 3 signatures")
+        return "2-of-3: 1 signature rejected, 2 pass, and the script does not exceed its powers"
 
     def three_of_five():
         members = random_members(5)
@@ -2312,14 +2435,14 @@ def register_multisig_checks(check):
         secrets_by_key = {item["pubkey"]: item["secret"] for item in members}
         if verify_p2wsh_multisig(scheme["witness_script"], scheme["keys"],
                                  secrets_by_key, 2)[0]:
-            raise AssertionError("2 signatures actually passed 3-of-5")
+            raise AssertionError("2 signatures passed 3-of-5")
         if not verify_p2wsh_multisig(scheme["witness_script"], scheme["keys"],
                                      secrets_by_key, 3)[0]:
-            raise AssertionError("3-of-5 should pass")
-        return "3-of-5: 2 signatures are rejected, 3 pass."
+            raise AssertionError("3-of-5 should have passed")
+        return "3-of-5: 2 rejected, 3 pass"
 
     def wrong_signer_rejected():
-        # Three people are on the list, but signing with a private key outside the list should not pass.
+        # Three people are on the list, but signing with a private key from outside it must not pass
         members = random_members(3)
         outsider = random_members(1)[0]
         scheme = build_p2wsh_scheme(members, 2)
@@ -2331,12 +2454,12 @@ def register_multisig_checks(check):
             scheme["witness_script"], stack,
             lambda sig, pk: ecdsa_verify(message, sig, pk))
         if ok:
-            raise AssertionError("People who were not on the list actually signed successfully.")
-        return "Signatures from non-member keys are rejected."
+            raise AssertionError("somebody outside the list signed successfully")
+        return "the signature of a member outside the list is rejected"
 
     def sorting_matters():
-        # There is about a 1/6 probability that \"byte ascending order\" and \"fingerprint order\" under a random public key are exactly the same.
-        # Directly asserting that the two addresses are different will occasionally fail, so change a few groups first until the sorting is really different.
+        # With random public keys, "ascending by bytes" and "fingerprint order" coincide with probability about 1/6,
+        # so asserting that the two addresses differ outright would fail now and then; a few sets are tried until the orderings really differ.
         by67 = byfinger = None
         for _ in range(50):
             members = random_members(3)
@@ -2345,54 +2468,54 @@ def register_multisig_checks(check):
             if by67["keys"] != byfinger["keys"]:
                 break
         else:
-            raise AssertionError("50 consecutive sets of public keys failed to distinguish between the two orderings, and the test itself failed.")
+            raise AssertionError("50 consecutive sets of public keys did not distinguish the two orderings; the test itself is broken")
         if by67["keys"] != sorted(by67["keys"]):
-            raise AssertionError("BIP67 result is not in byte ascending order")
+            raise AssertionError("the BIP67 result is not sorted ascending by bytes")
         if by67["address"] == byfinger["address"]:
-            raise AssertionError("The two sortings give the same address, but the sorting does not take effect.")
+            raise AssertionError("both orderings give the same address, so the sorting had no effect")
         if by67["witness_script"] == byfinger["witness_script"]:
-            raise AssertionError("Two sortings give the same witnessScript, but the sorting does not take effect.")
-        return "Ordering changes the address (BIP67 lexicographic order)."
+            raise AssertionError("both orderings give the same witnessScript, so the sorting had no effect")
+        return "the ordering really changes the address (BIP67 ascending by bytes)"
 
     def taproot_all_sign():
-        # Run a few more rounds: the y parity bits of the output public key are approximately random. If you run only one round, there is about half a probability of not touching a certain side.
+        # Run several rounds: the parity of the output key y is nearly random, so a single round has about a 50% chance of never hitting one side
         rounds = 12
         for _ in range(rounds):
             members = random_members(3)
             scheme = build_taproot_scheme(members, "chain")
             rows = run_scheme_checks(scheme, members)
             if len(rows) < 2:
-                raise AssertionError("Too few use cases: %s" % (rows,))
+                raise AssertionError("too few cases: %s" % (rows,))
             for label, expect_pass, actual_pass, detail in rows:
-                # Key: Determine \"whether the behavior meets expectations\" rather than \"whether the signature verification passes.\"
-                # When there is one less person to sign, the script should reject it. In this case, actual_pass is False.
+                # The point is to judge whether the behaviour matches the expectation, not whether verification passes.
+                # When one signature is short the script is supposed to reject, so actual_pass being False is correct here.
                 if actual_pass != expect_pass:
-                    raise AssertionError("%s behaves opposite of expected: %s" % (label, detail))
+                    raise AssertionError("%s behaves the opposite of what was expected: %s" % (label, detail))
             if not any(expect and actual for _l, expect, actual, _d in rows):
-                raise AssertionError("There is no use case that has been signed by all employees.")
+                raise AssertionError("no case where everyone signed was reached")
             if not any((not expect) and (not actual) for _l, expect, actual, _d in rows):
-                raise AssertionError("There is no use case where one person signed less and was rejected.")
-        return "bc1p: over %d trials, the required signature count passes and fewer signers fail." % rounds
+                raise AssertionError("no case where one missing signature was rejected was reached")
+        return "bc1p: over %d rounds, 3 signatures always pass and 2 signatures are always rejected" % rounds
 
     def taproot_internal_key_matters():
         members = random_members(2)
         scheme = build_taproot_scheme(members, "chain")
         if NUMS_X == BASE_X.to_bytes(32, "big"):
-            raise AssertionError("The internal public key should not be the base point G")
+            raise AssertionError("the internal public key should not be the base point G")
         if taproot_output_key(BASE_X.to_bytes(32, "big"),
                               scheme["merkle_root"]) == scheme["output_key"]:
-            raise AssertionError("The output public key is not affected by the internal public key")
-        return "The output key depends on the internal key, which is the NUMS key rather than the generator."
+            raise AssertionError("the output key is unaffected by the internal public key")
+        return "the output key depends on the internal public key, and that key is NUMS, not G"
 
     def taproot_tree_layout_differs():
         members = random_members(3)
         chain = build_taproot_scheme(members, "chain")
         tree = build_taproot_scheme(members, "tree")
         if chain["address"] == tree["address"]:
-            raise AssertionError("The chain and tree layouts have the same address")
+            raise AssertionError("the chain and tree layouts unexpectedly give the same address")
         if chain["signature_count"] != tree["signature_count"]:
-            raise AssertionError("The number of signatures should be the same for both layouts")
-        return '"chain" and "tree" produce two different addresses.'
+            raise AssertionError("the two layouts should need the same number of signatures")
+        return "chain and tree are two different addresses"
 
     def address_prefixes():
         members = random_members(3)
@@ -2400,13 +2523,13 @@ def register_multisig_checks(check):
         p2tr = build_taproot_scheme(members, "chain")
         expect_equal("bc1q prefix", p2wsh["address"][:4], "bc1q")
         expect_equal("bc1p prefix", p2tr["address"][:4], "bc1p")
-        expect_equal("Compatible address has been removed",
+        expect_equal("the compatibility address is gone",
                      "p2sh_p2wsh_address" in p2wsh or "p2sh_legacy_address" in p2wsh,
                      False)
-        return "bc1q / bc1p prefixes are correct and old P2SH is no longer generated"
+        return "the bc1q and bc1p prefixes are correct and legacy P2SH is no longer generated"
 
     def mainnet_only():
-        # This tool only works on the mainnet, and no testnet address should appear on any entrance.
+        # This tool only does mainnet, so no entry point may produce a testnet address anymore
         members = random_members(3)
         produced = []
         for threshold in (1, 2, 3):
@@ -2416,10 +2539,10 @@ def register_multisig_checks(check):
         produced.append(build_taproot_scheme(members, "tree")["address"])
         for address in produced:
             if address.startswith(("tb1", "bcrt1")):
-                raise AssertionError("A non-mainnet address popped up:" + address)
+                raise AssertionError("a non-mainnet address showed up: " + address)
         if not produced[0].startswith("bc1q") or not produced[-1].startswith("bc1p"):
-            raise AssertionError("Mainnet prefix is wrong")
-        return "%d addresses are mainnet only; no tb1/bcrt1." % len(produced)
+            raise AssertionError("the mainnet prefix is wrong")
+        return "all %d addresses are mainnet, with no tb1/bcrt1" % len(produced)
 
     def member_input_forms():
         secret = 0x2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A2A
@@ -2431,52 +2554,52 @@ def register_multisig_checks(check):
         for form in forms:
             seen.add(parse_member(form)["pubkey"])
         if len(seen) != 1:
-            raise AssertionError("The five ways of writing the same private key parsed out %d different public keys." % len(seen))
-        return "WIF / hex / decimal / compressed pubkey / x-only forms all yield the same result."
+            raise AssertionError("the five ways of writing one private key parsed into %d different public keys" % len(seen))
+        return "the five forms WIF/hex/decimal/public key/x-only all agree"
 
     def inspect_addresses():
         members = random_members(3)
         p2wsh = build_p2wsh_scheme(members, 2)
         p2tr = build_taproot_scheme(members, "chain")
         cases = [
-            (p2wsh["address"], "SegWit v0", "bc1q multi-signature address"),
+            (p2wsh["address"], "SegWit v0", "bc1q multisig address"),
             (p2tr["address"], "Taproot", "bc1p address"),
         ]
         for address, expected, label in cases:
             report = inspect_address(address)
-            if "Can't understand" in report:
-                raise AssertionError("%s was misjudged as incomprehensible: %s" % (label, report.strip()))
+            if "Cannot make sense" in report:
+                raise AssertionError("%s was wrongly judged unparseable: %s" % (label, report.strip()))
             if expected not in report:
-                raise AssertionError("The parsing result of %s is incorrect: %s" % (label, report.strip()))
-        # Garbage input must give a prompt instead of throwing an exception
+                raise AssertionError("the parse result for %s is wrong: %s" % (label, report.strip()))
+        # Garbage input must produce a message instead of raising
         for junk in ("not-an-address", "bc1q", "", "0OIl"):
             report = inspect_address(junk)
-            if "Can't understand" not in report:
-                raise AssertionError("The garbage input %r was parsed successfully: %s" % (junk, report.strip()))
-        return "bc1q / bc1p / P2SH parse correctly, and malformed input is reported without crashing."
+            if "Cannot make sense" not in report:
+                raise AssertionError("garbage input %r was parsed successfully: %s" % (junk, report.strip()))
+        return "bc1q, bc1p and P2SH all parse, and garbage input only gets a message without crashing"
 
-    check("Witness script structure", witness_script_structure)
-    check("2-of-3 threshold enforced", threshold_enforced)
-    check("3-of-5 threshold enforced", three_of_five)
-    check("Signatures from non-member keys are rejected", wrong_signer_rejected)
-    check("Public key ordering changes the address", sorting_matters)
-    check("bc1p requires all signers", taproot_all_sign)
-    check("Taproot internal key", taproot_internal_key_matters)
-    check("Taproot chain vs tree", taproot_tree_layout_differs)
-    check("Address prefixes", address_prefixes)
-    check("Mainnet-only addresses", mainnet_only)
-    check("Member input formats", member_input_forms)
-    check("Address inspection", inspect_addresses)
+    check("witnessScript structure", witness_script_structure)
+    check("the 2-of-3 threshold holds", threshold_enforced)
+    check("the 3-of-5 threshold holds", three_of_five)
+    check("members outside the list are rejected", wrong_signer_rejected)
+    check("public key ordering changes the address", sorting_matters)
+    check("bc1p everyone signs", taproot_all_sign)
+    check("the Taproot internal public key", taproot_internal_key_matters)
+    check("the two Taproot layouts", taproot_tree_layout_differs)
+    check("address prefixes", address_prefixes)
+    check("only mainnet addresses", mainnet_only)
+    check("member input formats", member_input_forms)
+    check("address parsing with inspect", inspect_addresses)
 
 
-#---------- Official vector (BIP143 native SegWit signature hash) ----------
-# Article by article copied from the official example in the BIP143 specification text.
-# Note that the scriptCode line comes with the compact_size length prefix in the original text, which has been stripped off when copied.
-# Covers native P2WPKH, P2SH-P2WPKH, and native P2WSH (including SINGLE out-of-bounds),
-# And P2SH-P2WSH 6-of-6 is signed once with each of the 6 hash types.
+# ---------- Official vectors (BIP143 native SegWit signature hash) ----------
+# Copied one by one from the official examples in the BIP143 specification text.
+# Note the scriptCode line in the original carries a compact_size length prefix, which has been stripped here.
+# It covers native P2WPKH, P2SH-P2WPKH and native P2WSH (including SINGLE out of range),
+# plus P2SH-P2WSH 6-of-6 signed once with each of the 6 hash types.
 BIP143_VECTORS = [
     {
-        "name": "Native P2WPKH",
+        "name": "native P2WPKH",
         "tx": "0100000002fff7f7881a8099afa6940d42d1e7f6362bec38171ea3edf433541db4e4ad969f0000000000eeffffffef51e1b804cc89d182d279655c3aa89e815b1b309fe287d9b2b55d57b90ec68a0100000000ffffffff02202cb206000000001976a9148280b37df378db99f66f85c95a783a76ac7a6d5988ac9093510d000000001976a9143bde42dbee7e4dbe6a21b2d50ce2f0167faa815988ac11000000",
         "vin": 1,
         "amount": 600000000,
@@ -2496,7 +2619,7 @@ BIP143_VECTORS = [
         },
     },
     {
-        "name": "Native P2WSH (SINGLE out of bounds)",
+        "name": "native P2WSH (SINGLE out of range)",
         "tx": "0100000002fe3dc9208094f3ffd12645477b3dc56f60ec4fa8e6f5d67c565d1c6b9216b36e0000000000ffffffff0815cf020f013ed6cf91d29f4202e8a58726b1ac6c79da47c23d1bee0a6925f80000000000ffffffff0100f2052a010000001976a914a30741f8145e5acadf23f751864167f32e0963f788ac00000000",
         "vin": 1,
         "amount": 4900000000,
@@ -2523,12 +2646,12 @@ BIP143_VECTORS = [
 ]
 
 
-#---------- Official vector (BIP341 Taproot signature hash) ----------
-# Automatically generated by gen_taproot_sighash_table.py from BIP341 official vectors.
-# Override keyPathSpending for all 7 inputs: ALL / NONE / SINGLE / DEFAULT
-# and three ANYONECANPAY combinations; merkle_root of some entries is not empty,
-# Used to check taproot_tweak at the same time and commit the merkle root together.
-# Automatically generated by gen_taproot_sighash_table.py from BIP341 official vectors
+# ---------- Official vectors (BIP341 Taproot signature hash) ----------
+# Generated automatically from the official BIP341 vectors by gen_taproot_sighash_table.py.
+# It covers all 7 inputs of keyPathSpending: ALL / NONE / SINGLE / DEFAULT
+# as well as the three ANYONECANPAY combinations; some entries have a non-empty merkle_root,
+# which also checks that taproot_tweak commits to the merkle root.
+# Generated automatically from the official BIP341 vectors by gen_taproot_sighash_table.py
 TAPROOT_SIGHASH_VECTOR = {
     "unsigned": "02000000097de20cbff686da83a54981d2b9bab3586f4ca7e48f57f5b55963115f3b334e9c010000000000000000d7b7cab57b1393ace2d064f4d4a2cb8af6def61273e127517d44759b6dafdd990000000000fffffffff8e1f583384333689228c5d28eac13366be082dc57441760d957275419a418420000000000fffffffff0689180aa63b30cb162a73c6d2a38b7eeda2a83ece74310fda0843ad604853b0100000000feffffffaa5202bdf6d8ccd2ee0f0202afbbb7461d9264a25e5bfd3c5a52ee1239e0ba6c0000000000feffffff956149bdc66faa968eb2be2d2faa29718acbfe3941215893a2a3446d32acd050000000000000000000e664b9773b88c09c32cb70a2a3e4da0ced63b7ba3b22f848531bbb1d5d5f4c94010000000000000000e9aa6b8e6c9de67619e6a3924ae25696bb7b694bb677a632a74ef7eadfd4eabf0000000000ffffffffa778eb6a263dc090464cd125c466b5a99667720b1c110468831d058aa1b82af10100000000ffffffff0200ca9a3b000000001976a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac807840cb0000000020ac9a87f5594be208f8532db38cff670c450ed2fea8fcdefcc9a663f78bab962b0065cd1d",
     "scripts": [
@@ -2627,18 +2750,18 @@ def register_official_sighash_checks(check):
                 expect_equal("BIP143 %s hashType=%s" % (case["name"], key),
                              got.hex(), expected)
                 passed += 1
-        return "All %d official vectors match (across hash types)." % passed
+        return "all %d official vectors match (including the 6 hash types)" % passed
 
     def taproot_sighash_official():
         vector = TAPROOT_SIGHASH_VECTOR
         tx = parse_transaction(bytes.fromhex(vector["unsigned"]))
         scripts = [bytes.fromhex(item) for item in vector["scripts"]]
         amounts = vector["amounts"]
-        expect_equal("The number of prevout is consistent with the number of inputs", len(scripts), len(tx.inputs))
+        expect_equal("the prevout count matches the input count", len(scripts), len(tx.inputs))
 
         signed = parse_transaction(bytes.fromhex(vector["signed"]))
         # BIP144: version | marker | flag | txins | txouts | witnesses | locktime
-        expect_equal("Official signed transaction serialization round trip",
+        expect_equal("the official signed transaction serializes and round trips",
                      signed.serialize(with_witness=True).hex(), vector["signed"])
 
         passed = 0
@@ -2655,23 +2778,23 @@ def register_official_sighash_checks(check):
             expect_equal("TapSighash input %d hashType=%#04x" % (index, case["hashType"]),
                          message.hex(), case["sighash"])
 
-            # The last item in the official witness is the Schnorr signature (the last digit is the hash type when it is 65 bytes)
+            # the last item in the official witness is the Schnorr signature (for 65 bytes the last byte is the hash type)
             raw = signed.inputs[index].witness[-1]
             signature = raw[:64]
             output_x = taproot_output_key(internal_x, merkle_root)
             if not schnorr_verify(message, output_x, signature):
-                raise AssertionError("Official Schnorr signature failed signature verification under derived output public key: enter %d"
+                raise AssertionError("the official Schnorr signature fails to verify under the derived output key: input %d"
                                      % index)
             passed += 1
-        return "All %d vectors match (tweak, output key, Schnorr verification included)." % passed
+        return "all %d official vectors match (including the tweak, the output key and Schnorr verification)" % passed
 
     def bip342_script_path_extension():
-        """The BIP342 script path extension must follow the BIP341 generic SigMsg.
+        """The BIP342 script-path extension must follow the common BIP341 SigMsg.
 
-The official vectors are not copied here (there is no scriptPathSpending in wallet-test-vectors.json of BIP341).
-Instead, manually spell out the expected value according to the original text of BIP342: sigMsg should be appended at the end.
-tapleaf_hash(32) || key_version(0x00) || codesep_pos(4 bytes little endian).
-Everything works fine with the 37 bytes less key path, only the script path computes a completely different hash.
+        The official vectors are not copied here (BIP341's wallet-test-vectors.json has no scriptPathSpending);
+        instead the expected value is assembled by hand straight from BIP342: the end of sigMsg has to be extended with
+        tapleaf_hash(32) || key_version(0x00) || codesep_pos(4 bytes little-endian).
+        Without these 37 bytes the key path is perfectly fine; only the script path would end up with a completely different hash.
         """
         tx = Transaction(
             version=2,
@@ -2685,8 +2808,8 @@ Everything works fine with the 37 bytes less key path, only the script path comp
         amounts = [150_000, 140_000]
         leaf_script = bytes.fromhex("20" + "cc" * 32 + "ac")
 
-        # Manually spell the public part of BIP341 general SigMsg according to the specification (hashType=0x00, which is SIGHASH_DEFAULT,
-        # The hash range is the same as ALL). spend_type and input_index are placed later and are spelled according to the spending method.
+        # Assemble the common part of the BIP341 SigMsg by hand as the spec says (hashType=0x00, i.e. SIGHASH_DEFAULT,
+        # which hashes the same range as ALL). spend_type and input_index are appended later, according to the spending type.
         common = bytes([0x00])
         common += (2).to_bytes(4, "little")
         common += (17).to_bytes(4, "little")
@@ -2699,24 +2822,24 @@ Everything works fine with the 37 bytes less key path, only the script path comp
         index_bytes = (0).to_bytes(4, "little")
 
         key_path = taproot_sighash(tx, 0, prevout_scripts, amounts, 0x00, ext_flag=0)
-        expect_equal("BIP341 Generic SigMsg", key_path.hex(),
+        expect_equal("the common BIP341 SigMsg", key_path.hex(),
                      tagged_hash("TapSighash", b"\x00" + common
                                  + bytes([0x00]) + index_bytes).hex())
 
-        # Script path: spend_type becomes 0x02, followed by the 37-byte BIP342 extension
+        # script path: spend_type becomes 0x02, followed by the 37-byte BIP342 extension
         extension = tapleaf_hash(leaf_script, LEAF_TAPSCRIPT)
         extension += b"\x00"                            # key_version
-        extension += (0xFFFFFFFF).to_bytes(4, "little")  # Not executed OP_CODESEPARATOR
+        extension += (0xFFFFFFFF).to_bytes(4, "little")  # OP_CODESEPARATOR never ran
         script_path = taproot_sighash(tx, 0, prevout_scripts, amounts, 0x00,
                                       ext_flag=1, script=leaf_script)
-        expect_equal("BIP342 script-path extension", script_path.hex(),
+        expect_equal("the BIP342 script-path extension", script_path.hex(),
                      tagged_hash("TapSighash", b"\x00" + common
                                  + bytes([0x02]) + index_bytes + extension).hex())
 
         if key_path == script_path:
-            raise AssertionError("The script path and key path calculate the same hash, indicating that the extension is ignored")
+            raise AssertionError("the script path and the key path give the same hash, so the extension was ignored")
 
-        # When OP_CODESEPARATOR is executed, codesep_pos is replaced with the real position, and the rest remains unchanged.
+        # When OP_CODESEPARATOR has run, codesep_pos becomes the real position and everything else stays the same
         with_sep = taproot_sighash(tx, 0, prevout_scripts, amounts, 0x00,
                                    ext_flag=1, script=leaf_script, codeseparator_pos=3)
         expect_equal("BIP342 codesep_pos=3", with_sep.hex(),
@@ -2724,32 +2847,132 @@ Everything works fine with the 37 bytes less key path, only the script path comp
                                  + bytes([0x02]) + index_bytes + extension[:-4]
                                  + (3).to_bytes(4, "little")).hex())
         if with_sep == script_path:
-            raise AssertionError("codeseparator_pos does not go into the hash")
+            raise AssertionError("codeseparator_pos did not enter the hash")
 
-        # Extensions and signatures must be compatible: signature -> signature verification and go through the real process
+        # The extension and the signature must work together: sign, then verify through the real flow
         secret = 0x0111111111111111111111111111111111111111111111111111111111111111
         xonly = pubkey_to_xonly(compressed_pubkey(secret))
         signature = schnorr_sign(script_path, secret)
         if not schnorr_verify(script_path, xonly, signature):
-            raise AssertionError("Script path signature self-verification failed")
-        return "Key path, script path, and codesep_pos all correct; the extension is 37 bytes."
+            raise AssertionError("the script-path signature failed its own verification")
+        return "key path, script path and codesep_pos are all correct, with the 37-byte extension"
 
-    check("BIP143 official signature hashes", bip143_official)
-    check("BIP341 official signature hashes", taproot_sighash_official)
+    check("BIP143 official signature hash", bip143_official)
+    check("BIP341 official signature hash", taproot_sighash_official)
     check("BIP342 script-path extension", bip342_script_path_extension)
 
-#================= Output format =================
-def cell(value):
-    """Unify the display of None."""
-    return "—" if value is None else str(value)
+# ================= Output formatting =================
+# Every render_* goes through the scheme below, otherwise the output ends up all over the place:
+#   1) one block = the title embedded in the top border + the body + one bottom border, so only a single frame is drawn;
+#   2) alignment is computed in display width (Chinese counts as two columns), never with the %-12s style that pads by character count;
+#   3) overlong values (hex, descriptors) are wrapped instead of stretching into one line of hundreds of characters;
+#   4) the same warning appears once instead of being repeated for every member.
+LINE_WIDTH = 76                       # wide enough for a bc1p address or a compressed public key to sit on one line each
+VALUE_GAP = 2                        # number of spaces between the label column and the value column
+HEX_CHUNK = 64                       # at most 64 hex characters per line (32 bytes)
+WARNING_TEXT = "The private keys stay on your side; do not post them online or commit them to a repository."
 
 
-def hex_or_none(data):
-    return None if data is None else data.hex()
+def display_width(text):
+    """Measure a length in terminal display columns (Chinese counts as two)."""
+    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def pad_display(text, width):
+    """Pad on the right up to the given display width."""
+    return text + " " * max(0, width - display_width(text))
+
+
+def rule(title=None, char="="):
+    """The border of a block. With a title the title is embedded in the top border, which saves it two lines of its own."""
+    if not title:
+        return char * LINE_WIDTH
+    head = char * 2 + " " + title + " "
+    return head + char * max(3, LINE_WIDTH - display_width(head))
+
+
+def block(title, body):
+    """Title + body lines -> one complete block."""
+    return "\n".join([rule(title)] + list(body) + [rule()])
+
+
+def split_columns(text, columns):
+    """Split the text after display column columns; returns (the first half, the second half)."""
+    used = 0
+    for index, char in enumerate(text):
+        used += display_width(char)
+        if used > columns:
+            return text[:index], text[index:]
+    return text, ""
+
+
+def wrap_value(value, width):
+    """Wrap a long value: bytes break on whole bytes; str prefers to break after a comma, a space or a closing bracket, otherwise it breaks hard by display width.
+
+    Wrapping must be lossless: joining the pieces back has to equal the original, so never rstrip at the end of a line,
+    and when breaking after a space the space stays at the end of the line (invisible in the terminal).
+    """
+    if value is None:
+        return ["—"]
+    if isinstance(value, (bytes, bytearray)):
+        text = bytes(value).hex()
+        chunk = min(HEX_CHUNK, width // 2 * 2)         # an even number of characters, so a line is a whole number of bytes
+        return [text[start:start + chunk] for start in range(0, len(text), chunk)] or [""]
+    text = str(value)
+    if display_width(text) <= width:
+        return [text]
+    lines = []
+    rest = text
+    while display_width(rest) > width:
+        head, tail = split_columns(rest, width)
+        cut = max(head.rfind(separator) for separator in (",", " ", ")"))
+        if cut > width // 2:                          # the second half still has content, so break after the separator
+            head, tail = rest[:cut + 1], rest[cut + 1:]
+        lines.append(head)
+        rest = tail
+    if rest:
+        lines.append(rest)
+    return lines
+
+
+def paragraph(text, indent="  ", hanging="    "):
+    """Wrap a whole paragraph of explanatory text: the first line carries indent, the continuation lines are indented by hanging."""
+    chunks = wrap_value(text, LINE_WIDTH - display_width(indent))
+    return [indent + chunks[0]] + [hanging + chunk for chunk in chunks[1:]]
+
+
+def kv_rows(rows, indent="  ", label_width=None):
+    """A list of (label, value) -> aligned two-column text lines; when a value wraps it stays aligned with the value column."""
+    column = label_width or max([display_width(label) for label, _value in rows] + [0])
+    room = max(16, LINE_WIDTH - display_width(indent) - column - VALUE_GAP)
+    lines = []
+    for label, value in rows:
+        chunks = wrap_value(value, room)
+        lines.append(indent + pad_display(label, column) + " " * VALUE_GAP + chunks[0])
+        continuation = indent + " " * (column + VALUE_GAP)
+        lines.extend(continuation + chunk for chunk in chunks[1:])
+    return lines
+
+
+def check_lines(items, mark_width):
+    """[mark] description + detail. If it fits they share a line, otherwise the detail is wrapped below."""
+    indent = " " * (2 + mark_width + 4)
+    lines = []
+    for mark, label, detail in items:
+        head = "  [%s]  %s" % (pad_display(mark, mark_width), label)
+        if not detail:
+            lines.append(head)
+        elif display_width(head) + VALUE_GAP + display_width(detail) <= LINE_WIDTH:
+            lines.append(head + " " * VALUE_GAP + detail)
+        else:
+            lines.append(head)
+            lines.extend(indent + chunk
+                         for chunk in wrap_value(detail, LINE_WIDTH - len(indent)))
+    return lines
 
 
 def scheme_to_json(scheme):
-    """Convert the scheme into a JSON serializable structure."""
+    """Turn a scheme into a JSON-serializable structure."""
     result = {}
     for key, value in scheme.items():
         if isinstance(value, bytes):
@@ -2765,115 +2988,142 @@ def scheme_to_json(scheme):
     return result
 
 
-def render_scheme(scheme):
-    """The default is concise chunked output."""
+def scheme_tag(scheme):
+    """A short tag, used to tell two schemes apart within the same batch of output."""
     if scheme["type"] == "p2wsh":
-        header = "%d-of-%d multi-signature (bc1q, requires the signature of %d people)" % (
-            scheme["threshold"], scheme["members"], scheme["threshold"])
+        return "bc1q %d-of-%d" % (scheme["threshold"], scheme["members"])
+    return "bc1p %d all sign" % scheme["members"]
+
+
+def scheme_title(scheme):
+    if scheme["type"] == "p2wsh":
+        return "%s - any %d signatures can spend" % (scheme_tag(scheme), scheme["threshold"])
+    return "%s - everyone must sign, not one may be missing" % scheme_tag(scheme)
+
+
+def render_address(scheme):
+    """The address gets its own paragraph with blank lines around it, right after the title.
+
+    The address is the one thing this program really hands over, so it does not go into the two-column table as just another row:
+    it takes a line of its own with blank lines above and below, so it is never missed even with several schemes.
+    """
+    return ["", "  Receiving address (%s)" % scheme_tag(scheme),
+            "    " + scheme["address"], ""]
+
+
+def render_address_summary(schemes):
+    """The most convenient view of a batch of schemes: the addresses listed together so a whole block can be copied."""
+    if len(schemes) < 2:
+        return ""
+    body = ["  Here are the receiving addresses; do not copy the leading or trailing spaces:", ""]
+    for scheme in schemes:
+        body += ["  %s" % scheme_tag(scheme), "    %s" % scheme["address"], ""]
+    return block("Address list - %d in total" % len(schemes), body[:-1])
+
+
+def render_key_list(title, keys):
+    """The member public key list: index + public key, one per line."""
+    lines = ["", "  " + title]
+    for index, key in enumerate(keys, 1):
+        lines.append("    %2d  %s" % (index, key.hex()))
+    return lines
+
+
+def scheme_body(scheme):
+    """The scheme body: address, descriptor, members."""
+    if scheme["type"] == "p2wsh":
         rows = [
-            ("Primary address bc1q", scheme["address"]),
-            ("descriptor", descriptor_with_checksum(scheme["descriptor"])),
+            ("Descriptor", descriptor_with_checksum(scheme["descriptor"])),
+            ("Ordering", "BIP67, public keys ascending by bytes" if scheme["order"] == "bip67"
+                     else "sorted by public key fingerprint (the old practice from before BIP67)"),
         ]
+        members = "Members (%d in total; these public keys below are what the address is computed from)" % scheme["members"]
     else:
-        header = "%d-of-%d signed by all members (bc1p, no one of %d can be missing)" % (
-            scheme["threshold"], scheme["members"], scheme["threshold"])
         rows = [
-            ("Primary address bc1p", scheme["address"]),
-            ("Output public key", scheme["output_key"].hex()),
-            ("descriptor", descriptor_with_checksum(scheme["descriptor"])),
+            ("Output key", scheme["output_key"]),
+            ("Descriptor", descriptor_with_checksum(scheme["descriptor"])),
+            ("Structure", "chain: one CHECKSIG chain strings all the signatures together" if scheme["layout"] == "chain"
+                     else "tree: one leaf per member, and a script-path spend only proves one leaf at a time"),
         ]
-    lines = ["=" * 64, header, "=" * 64]
-    lines += ["  %-12s %s" % (label, value) for label, value in rows]
-    lines.append("")
-    lines.append("Members (by %s):" % ("BIP67 sorting" if scheme["type"] == "p2wsh" else "x coordinate ascending order"))
-    if scheme["type"] != "p2wsh":
-        lines.append("Note: The following is an x-only public key (the compressed public key removes the first 02/03 bytes).")
-    for index, key in enumerate(scheme["keys"], 1):
-        lines.append("   %2d. %s" % (index, key.hex()))
-    lines.append("=" * 64)
-    return "\n".join(lines)
+        members = "Members (%d in total; the 32-byte x-only public keys are listed below)" % scheme["members"]
+    return render_address(scheme) + kv_rows(rows) + render_key_list(members, scheme["keys"]) \
+        + [""] + paragraph("Note: " + scheme["note"])
+
+
+def scheme_script_detail(scheme):
+    """The script details that only -d gives."""
+    if scheme["type"] == "p2wsh":
+        rows = [("witnessScript", scheme["witness_script"]),
+                ("scriptPubKey", scheme["script_pubkey"])]
+        return [""] + kv_rows(rows)
+    rows = [("Leaf script %d" % index, script)
+            for index, script in enumerate(scheme["leaf_scripts"], 1)]
+    rows += [("merkle root", scheme["merkle_root"]),
+             ("Control block", scheme["control_blocks"][0]),
+             ("scriptPubKey", scheme["script_pubkey"])]
+    lines = [""] + kv_rows(rows) + ["", "  Witness stack template (top first):"]
+    lines += ["    %d  the Schnorr signature of member number %d" % (index, index + 1)
+              for index in range(len(scheme["keys"]))]
+    lines.append("    %d  control block" % len(scheme["keys"]))
+    return lines
+
+
+def render_scheme(scheme):
+    """The default output: address, descriptor, member list."""
+    return block(scheme_title(scheme), scheme_body(scheme))
 
 
 def render_scheme_detail(scheme):
-    """Complete information when adding -d: scripts, paths, and control blocks are fully expanded."""
-    lines = [render_scheme(scheme), ""]
-    if scheme["type"] == "p2wsh":
-        lines += [
-            "  witnessScript  ", scheme["witness_script"].hex(),
-            "  scriptPubKey   ", scheme["script_pubkey"].hex(),
-            "redeemScript(old)", scheme["witness_script"].hex(),
-            "",
-        ]
-    else:
-        lines += [
-            "leaf script", scheme["leaf_scripts"][0].hex(),
-            "  merkle root    ", scheme["merkle_root"].hex(),
-            "control block", scheme["control_blocks"][0].hex(),
-            "  scriptPubKey   ", scheme["script_pubkey"].hex(),
-            "",
-            "Witness stack template (signed by all members):",
-        ]
-        for index in range(len(scheme["keys"])):
-            lines.append("[%d] <Schnorr signature of member %d>" % (index, index + 1))
-        lines.append("[%d] <control block>" % len(scheme["keys"]))
-        lines.append("")
-    lines.append("illustrate:" + scheme["note"])
-    return "\n".join(lines)
+    """The full information with -d: witnessScript, leaf scripts and control blocks all expanded."""
+    return block(scheme_title(scheme) + " - details",
+                 scheme_body(scheme) + scheme_script_detail(scheme))
 
 
 def render_members(members):
-    lines = ["=" * 64, "member key", "=" * 64]
-    all_secret_keys = all(item.get("secret") for item in members)
-    for index, item in enumerate(members, 1):
-        lines.append("%2d. Private key (WIF) %s" % (index, item["source"]))
-        lines.append("↑ Keep it confidential! This is your signing authority. Don't save it online or tell anyone.")
-        lines.append("Public key %s" % item["pubkey"].hex())
-        lines.append("↑ This one may be public; it is used to assemble the multisig address with counterparties.")
-        secret = item.get("secret")
-        if secret:
-            ok = compressed_pubkey(secret) == item["pubkey"]
-            lines.append("Check %s" % ("Pass - the public key in the above line was indeed generated from that private key" if ok
-                                                 else "Exception - The public key does not match the private key!"))
-        lines.append("")
-    if all_secret_keys:
-        lines.append("It has been verified item by item: the \"public key\" of each row is indeed derived from the corresponding \"private key\".")
-    lines.append("=" * 64)
-    return "\n".join(lines)
+    """The member list: the private keys and public keys each get a column aligned by index, and the warning is stated only once."""
+    body = []
+    holders = [item for item in members if item.get("secret")]
+    if holders:
+        body += paragraph("Private keys (WIF) - this is the signing right, keep them on your own machine only", "  ", "    ")
+        body.append("")
+        body += ["    %2d  %s" % (index, item["source"])
+                 for index, item in enumerate(members, 1) if item.get("secret")]
+        body.append("")
+    body += paragraph("Public keys - use them together with other people public keys to build a multisig address; they may be public", "  ", "    ")
+    body += ["    %2d  %s" % (index, item["pubkey"].hex())
+             for index, item in enumerate(members, 1)]
+    if len(holders) == len(members):
+        matched = all(compressed_pubkey(item["secret"]) == item["pubkey"] for item in members)
+        body += [""] + paragraph("Each item has been checked: every public key was derived from its private key %s"
+                                 % ("." if matched else "(some do not match, check the input!)."))
+    body += [""] + paragraph("Warning: " + WARNING_TEXT)
+    return block("Member keys - %d in total" % len(members), body)
 
 
 def render_verify_report(title, rows):
-    """Plan verification report. Each item in rows is (description, whether expected to pass, whether actually passed, details)."""
-    lines = ["=" * 64, "  " + title, "=" * 64]
-    for label, expect_pass, actual_pass, detail in rows:
-        mark = "pass" if actual_pass == expect_pass else "fail"
-        lines.append("  [%s] %-34s %s" % (mark, label, detail))
-    lines.append("=" * 64)
-    return "\n".join(lines)
+    """The verification report of a scheme. Each row of rows is (description, expected to pass, actually passed, detail)."""
+    items = [("as expected" if actual == expect else "unexpected", label, detail)
+             for label, expect, actual, detail in rows]
+    return block(title, check_lines(items, display_width("as expected")))
 
 
 def render_selftest_report(title, checks):
-    """Self-test report. Each check item is (name, passed or not, details)."""
-    lines = ["=" * 64, "  " + title, "=" * 64]
-    for name, ok, detail in checks:
-        lines.append("  [%s] %-34s %s" % ("pass" if ok else "fail", name, detail))
-    lines.append("=" * 64)
-    return "\n".join(lines)
+    """The self-test report. Each item of checks is (name, passed, detail)."""
+    items = [("pass" if ok else "fail", name, detail) for name, ok, detail in checks]
+    failed = len([item for item in checks if not item[1]])
+    summary = ("%d checks in total, %d failed." % (len(checks), failed) if failed
+               else "%d checks in total, all passed, the program is fine." % len(checks))
+    return block(title, check_lines(items, display_width("pass")) + ["", "  " + summary])
 
 
 def write_output(text, path):
-    """Output to a file or standard output."""
+    """Write to a file or to standard output."""
     if path in (None, "", "-"):
         print(text)
         return
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text + "\n")
     print("Saved to %s" % path)
-
-
-def display_width(text):
-    """The length is calculated according to the terminal display width (Chinese is calculated as two spaces)."""
-    import unicodedata
-    return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
 
 
 def pause_before_exit(message="\nPress Enter to close the window..."):
@@ -2885,22 +3135,22 @@ def pause_before_exit(message="\nPress Enter to close the window..."):
 
 
 def backend_note():
-    """Backend instructions for -v."""
-    parts = ["curve" + CURVE_BACKEND]
-    parts.append("SegWit address encoding" + ("bech32m library" if HAVE_BECH32M else "built-in"))
-    parts.append("Base58 encoding" + ("base58 library" if HAVE_BASE58 else "built-in"))
-    return ",".join(parts)
+    """The backend description used by -v."""
+    parts = ["curve " + CURVE_BACKEND]
+    parts.append("SegWit address encoding " + ("bech32m library" if HAVE_BECH32M else "built in"))
+    parts.append("Base58 encoding " + ("base58 library" if HAVE_BASE58 else "built in"))
+    return ", ".join(parts)
 
 
-#================= Plan verification demonstration =================
+# ================= End-to-end verification demo =================
 def run_scheme_checks(scheme, members, verbose=False):
-    """Perform end-to-end verification of the built solution to prove that the script actually works as expected.
+    """Run an end-to-end verification of the scheme that was built, proving that the script really behaves as expected.
 
-One less person will be deliberately signed, and the verification script will indeed reject it - just checking \"if you sign enough to pass\" does not explain the threshold.
+    One signature is deliberately left out to confirm that the script does reject; only checking that enough signatures pass says nothing about the threshold.
 
-Returns (description, expected pass, actual pass, details) for each row.
-By returning \"expected\" and \"actual\" separately, the caller can judge whether the behavior meets expectations;
-If only Boolean values are returned, \"correctly rejected\" and \"erroneously passed\" will be mixed together.
+    Each row returns (description, expected to pass, actually passed, detail).
+    Returning "expected" and "actual" separately is what lets the caller judge whether the behaviour matches the expectation;
+    a single boolean would mix "correctly rejected" and "wrongly passed" together.
     """
     rows = []
 
@@ -2908,9 +3158,9 @@ If only Boolean values are returned, \"correctly rejected\" and \"erroneously pa
         secrets_by_key = {item["pubkey"]: item["secret"] for item in members if item["secret"]}
         ordered = [key for key in scheme["keys"] if key in secrets_by_key]
         if len(ordered) < scheme["threshold"]:
-            return [("Insufficient member private key, skip", True, True,
-                     "Only got %d/%d private keys" % (len(ordered), scheme["threshold"]))]
-        # When the threshold is 1, there is no testable scenario with \"one less person\" (0 people cannot construct the witness stack), and only the compliance situation is measured.
+            return [("not enough member private keys, skipped", True, True,
+                     "only %d of %d private keys were available" % (len(ordered), scheme["threshold"]))]
+        # With a threshold of 1 there is no "one person short" case to measure (a witness stack cannot be built with 0 people), so only the satisfied case is tested
         counts = [scheme["threshold"]]
         if scheme["threshold"] - 1 >= 1:
             counts.insert(0, scheme["threshold"] - 1)
@@ -2918,16 +3168,15 @@ If only Boolean values are returned, \"correctly rejected\" and \"erroneously pa
             expect_pass = (count == scheme["threshold"])
             actual, detail = verify_p2wsh_multisig(scheme["witness_script"], ordered,
                                                  secrets_by_key, count)
-            label = "%d/%d person signature (%s)" % (count, len(ordered),
-                                           "should pass" if expect_pass else "should fail")
-            rows.append((label, expect_pass, actual, detail))
+            rows.append((signature_scenario_label(count, len(ordered), expect_pass),
+                         expect_pass, actual, detail))
         return rows
 
     secrets_by_xonly = {pubkey_to_xonly(item["pubkey"]): item["secret"]
                         for item in members if item["secret"]}
     ordered = [key for key in scheme["keys"] if key in secrets_by_xonly]
     if not ordered:
-        return [("Insufficient member private key, skip", True, True, "Didn't get any member private key")]
+        return [("not enough member private keys, skipped", True, True, "no member private key was available")]
     leaf_script = scheme["leaf_scripts"][0]
     transaction = build_test_transaction()
     signatures = []
@@ -2937,24 +3186,29 @@ If only Boolean values are returned, \"correctly rejected\" and \"erroneously pa
         signatures.append(schnorr_sign(message, secrets_by_xonly[key]))
     for count in (len(signatures) - 1, len(signatures)):
         expect_pass = (count == len(signatures))
-        # The witness stack is in reverse order: the top of the stack is the signature of the last member, so it must be passed backwards.
+        # The witness stack is reversed: the top holds the last member signature, so it is passed back to front
         actual, detail = verify_taproot_script_path(leaf_script, list(reversed(signatures[:count])))
-        label = "%d/%d person signature (%s)" % (count, len(signatures),
-                                       "should pass" if expect_pass else "should fail")
-        rows.append((label, expect_pass, actual, detail))
+        rows.append((signature_scenario_label(count, len(signatures), expect_pass),
+                     expect_pass, actual, detail))
     return rows
 
 
-#================= Command line =================
+def signature_scenario_label(count, total, expect_pass):
+    """The scenario name in the verification report: it states how many signed and whether a pass or a rejection is expected."""
+    return "%d of %d signatures - should %s" % (count, total, "pass" if expect_pass else "be rejected")
+
+
+# ================= Command line =================
 def read_members_file(path):
+    # utf-8-sig is used: Windows Notepad writes UTF-8 with a BOM, and without stripping it the first line fails to parse
     if path in (None, "", "-"):
         return sys.stdin.read()
-    with open(path, encoding="utf-8") as handle:
+    with open(path, encoding="utf-8-sig") as handle:
         return handle.read()
 
 
 def default_threshold(count):
-    """Give a decent default threshold: 3 people -> 2, 5 people -> 3, at least 1 when there are few people."""
+    """A sensible default threshold: 3 people -> 2, 5 people -> 3, and at least 1 when there are fewer."""
     return min(count, max(2, count // 2 + 1))
 
 
@@ -2974,11 +3228,14 @@ def command_build(args):
             outputs.append(render_scheme(scheme))
         if args.verify:
             rows = run_scheme_checks(scheme, members, args.verbose)
-            outputs.append(render_verify_report("End-to-end signature verification", rows))
+            outputs.append(render_verify_report("end-to-end verification - " + scheme_tag(scheme), rows))
     if args.format == "json":
         write_output(json.dumps([scheme_to_json(item) for item in schemes],
                                 ensure_ascii=False, indent=2), args.out)
     else:
+        summary = render_address_summary(schemes)
+        if summary:                      # the address list goes first, so it is seen wherever you scroll to
+            outputs.insert(0, summary)
         write_output("\n\n".join(outputs), args.out)
     return 0
 
@@ -2994,91 +3251,103 @@ def command_keys(args):
     return 0
 
 
+def render_inspect_address(address, kind, extra=""):
+    """The address being parsed also gets its own paragraph, so the parse result lines up with the address at a glance."""
+    return ["", "  Address (%s)%s" % (kind, extra), "    " + address, ""]
+
+
 def inspect_address(address):
-    """What can you tell by looking at the address. It is not clear whether scriptPubKey is P2WPKH or P2WSH."""
-    lines = []
-    # segwit_decode returns (hrp, version, witness program), returns None if it is not a SegWit address
+    """What can be seen from an address. What cannot be seen is whether the scriptPubKey is P2WPKH or P2WSH."""
+    address = (address or "").strip()
+    # Non-ASCII input makes bech32 / base58 raise an encoding error, so it is caught first and answered in plain words
+    if not address:
+        return block("Address parsing", paragraph("Cannot make sense of this address: no address content was given."))
+    if not address.isascii():
+        return block("Address parsing", paragraph(
+            "Cannot make sense of this address: it contains non-ASCII characters, most likely"
+            "Chinese punctuation or full-width signs that came along when copying; please copy it again."))
+    # segwit_decode returns (hrp, version, witness program), or None when it is not a SegWit address
     decoded = segwit_decode(address)
     if decoded is not None:
         hrp, version, program = decoded
-        lines.append("Type: SegWit v%d%s" % (version, "(Taproot)" if version == 1 else ""))
-        lines.append("Prefix: %s..." % address[:8])
-        lines.append("Network: %s" % HRP_NAMES.get(hrp, hrp))
-        lines.append("Witness program: %s (%d bytes)" % (program.hex(), len(program)))
+        kind = "bc1p, Taproot" if version == 1 else "bc1q, %s" % HRP_NAMES.get(hrp, hrp)
+        rows = [
+            ("Type", "SegWit v%d%s" % (version, " (Taproot)" if version == 1 else "")),
+            ("Network", HRP_NAMES.get(hrp, hrp)),
+            ("Witness program", program),
+            ("Program length", "%d bytes" % len(program)),
+        ]
         if version == 0 and len(program) == 20:
-            lines.append("Note: P2WPKH and P2WSH are both 20 bytes and cannot be distinguished by just looking at the address.")
-            lines.append("You have to look at UTXO's scriptPubKey to know.")
+            rows.append(("Note", "P2WPKH and P2WSH are both 20 bytes, so the address alone cannot tell them apart;"
+                                 "you have to look at the scriptPubKey of the UTXO to know."))
         elif version == 0 and len(program) == 32:
-            lines.append("Description: P2WSH, multi-signature address is this.")
+            rows.append(("Note", "P2WSH, which is what multisig addresses are."))
         elif version == 1:
-            lines.append("Description: Taproot outputs the public key (bc1p).")
+            rows.append(("Note", "a Taproot output key (bc1p)."))
         else:
-            lines.append("Description: Unknown witness version, please confirm whether the address is correct.")
-        return "\n".join(lines)
+            rows.append(("Note", "an unknown witness version; please confirm that the address is correct."))
+        return block("Address parsing", render_inspect_address(address, kind) + kv_rows(rows))
     try:
         payload = base58check_decode(address)
         if not payload:
-            raise ValueError("Wrong length or checksum")
-        lines.append("Type: Base58Check (P2PKH or P2SH)")
-        lines.append("Content: %s" % payload.hex())
+            raise ValueError("the length or the checksum is wrong")
+        kind = "starting with 1" if payload[0] == 0x00 else "starting with 3" if payload[0] in (0x05, 0xC4) \
+            else "a legacy address"
+        rows = [("Type", "Base58Check (P2PKH or P2SH)"),
+                ("Payload", payload)]
         if payload[0] == 0x00:
-            lines.append("Description: P2PKH, scriptPubKey starts with 76a914.")
+            rows.append(("Note", "P2PKH, whose scriptPubKey starts with 76a914."))
         elif payload[0] in (0x05, 0xC4):
-            lines.append("Note: P2SH, scriptPubKey starting with a9 is an old-fashioned multi-signature.")
+            rows.append(("Note", "P2SH, where a scriptPubKey starting with a9 is a legacy multisig."))
         else:
-            lines.append("Explanation: The prefix %02x is not a common P2PKH/P2SH." % payload[0])
-        return "\n".join(lines)
+            rows.append(("Note", "the prefix %02x is not a common P2PKH/P2SH." % payload[0]))
+        return block("Address parsing", render_inspect_address(address, kind) + kv_rows(rows))
     except ValueError as error:
-        return "Can't understand this address: %s" % error
+        return block("Address parsing", paragraph("Cannot make sense of this address: %s" % error))
 
 
 def command_inspect(args):
     report = inspect_address(args.address)
     write_output(report, args.out)
-    # For addresses that are incomprehensible, the caller (script, pipeline) must be able to determine success or failure.
-    return 1 if "Can't understand" in report else 0
+    # An address that cannot be parsed has to let the caller (a script, a pipeline) tell success from failure
+    return 1 if "Cannot make sense" in report else 0
 
 
 def command_selftest(args):
-    """Built-in Self-test. By default, only one line of conclusions is reported, and -v is used to list each item."""
+    """The built-in self-test. By default it prints a one-line conclusion; -v lists every item."""
     checks = []
     register_checks(lambda name, function: collect_check(checks, name, function))
     if args.verbose:
         write_output(render_selftest_report("Self-test", checks), args.out)
         return 0 if all(item[1] for item in checks) else 1
     failed = [item for item in checks if not item[1]]
-    write_output("Total %d checks, %d failed." % (len(checks), len(failed)) if failed
-                 else "Program OK: %d checks, all passed." % len(checks), args.out)
+    write_output("%d checks in total, %d failed." % (len(checks), len(failed)) if failed
+                 else "%d checks in total, all passed, the program is fine." % len(checks), args.out)
     return 1 if failed else 0
 
 
 def collect_check(checks, name, function):
-    """Run a Self-test and note any abnormalities as results."""
+    """Run one self-test item and record any exception as its result."""
     try:
         checks.append((name, True, function() or ""))
-    except Exception as error:                    # Self-test should count any exception as a failure
+    except Exception as error:                    # the self-test counts any exception as a failed item
         checks.append((name, False, "%s: %s" % (type(error).__name__, error)))
 
 
-MENU_TEXT = """
-================== Bitcoin Multi-signature Tool V2 ==================
-1 One-click multisig plan
-     (the program creates the keys for you)
-2 Use your own member list  Paste xpub / public keys / private keys
-3 Inspect address
-4 Self-test
-0 Exit
-======================================================
-""".strip("\n")
-
-WARNING_TEXT = "The keys above are confidential. Keep any private keys offline and out of source control.tory."
+MENU_ITEMS = [
+    ("1", "One-click multisig scheme", "the program creates the private keys and hands you the address"),
+    ("2", "Build from your own list", "paste xpubs / public keys / private keys"),
+    ("3", "Parse an address", "see what type the address is"),
+    ("4", "Self-test", "run the built-in official vectors"),
+    ("0", "Quit", ""),
+]
 
 
 def prompt_members():
-    """Paste the member list.ter to end."""
-    print("WIF private key / 64-bit hex private key / decimal private key are all accepted.")
-    print("33-byte compressed public key / x: plus 64-bit x-only public key / xpub derivation path")
-    print("One per line, or comma-separated; press Enter on an empty line to finish:")
+    """Paste the members. One per line, and they can also be comma separated and pasted all at once; press Enter to finish."""
+    print("  These can be mixed: WIF private key / 64-hex-digit private key / decimal private key")
+    print("                     33-byte compressed public key / x: plus a 64-hex x-only public key / xpub derivation path")
+    print("  One per line, commas work too; press Enter to finish:")
     lines = []
     while True:
         try:
@@ -3092,88 +3361,87 @@ def prompt_members():
 
 
 def ask_threshold(members):
-    """bc1q requires several signatures. Just ask this sentence, press Enter to use the default value; if you make a mistake, ask again without reporting an error."""
+    """How many people bc1q needs. Only this one question; Enter uses the default, and a wrong entry is simply asked again without an error."""
     fallback = default_threshold(len(members))
     while True:
-        raw = input("Signatures required for bc1q (1-%d, press Enter for %d):" % (
+        raw = input("  How many signatures does bc1q need (1-%d, Enter for %d): " % (
             len(members), fallback)).strip()
         if not raw:
             return fallback
         try:
             value = int(raw)
         except ValueError:
-            print("Enter an integer between 1 and %d." % len(members))
+            print("  It has to be an integer between 1 and %d." % len(members))
             continue
         if 1 <= value <= len(members):
             return value
-        print("The threshold must be between 1 and %d; this plan has %d members." % (len(members), len(members)))
+        print("  The number has to be between 1 and %d, and you have %d members." % (len(members), len(members)))
 
 
 def show_schemes(members, threshold):
-    """Show both bc1q and bc1p plans. If all keys exist locally, verify signatures before asking to save. file."""
-    pairs = [("bc1q lets any m-of-n signers spend", build_p2wsh_scheme(members, threshold)),
-             ("bc1p requires every member to sign", build_taproot_scheme(members))]
-    blocks = []
-    for title, scheme in pairs:
-        text = render_scheme(scheme)
-        blocks.append("---- %s ----\n%s" % (title, text))
+    """Produce bc1q and bc1p together, verify once while the private keys are at hand, and finally ask whether to save to a file."""
+    schemes = [build_p2wsh_scheme(members, threshold), build_taproot_scheme(members)]
+    have_secrets = all(item["secret"] for item in members)
+    texts = []
+    summary = render_address_summary(schemes)
+    if summary:                          # the address list first, then the details
         print()
-        print("  ---- %s ----" % title)
+        print(summary)
+    for scheme in schemes:
+        text = render_scheme(scheme)
+        texts.append(text)
+        print()
         print(text)
-        if all(item["secret"] for item in members):
+        if have_secrets:
             print()
-            print(render_verify_report("End-to-end signature verification", run_scheme_checks(scheme, members)))
-    path = input("\n Save to file (press enter without saving):").strip()
+            print(render_verify_report("end-to-end verification - " + scheme_tag(scheme),
+                                       run_scheme_checks(scheme, members)))
+    path = input("\n  Save to a file (press Enter to skip):").strip()
     if path:
-        write_output("\n\n".join(blocks), path)
-        print("Saved to %s" % path)
+        write_output("\n\n".join(([summary] if summary else []) + texts), path)
     return 0
 
 
 def menu_build():
     print()
     members = parse_members(prompt_members())
-    if not members:
-        print("No members read, back to menu.")
-        return 0
-    print("Read %d members." % len(members))
+    print("  Read %d members." % len(members))
     return show_schemes(members, ask_threshold(members))
 
 
 def menu_quick():
-    """Shortest path: Say \"how many people v how many can sign\", the program creates the key and directly gives the address."""
+    """The shortest path: say how many people in total and how many of them can sign (like 3v2), and the program creates the keys and gives the address right away."""
     print()
-    print("How many people do you want and how many of them can sign? Write directly, for example:")
-    print("3v2 = signatures of any 2 of 3 members; 5v3 = 3 of 5.")
-    print("Just write a number (such as 4) to give only the number of people, and use the default value for the threshold.")
+    print("  How many people in total, and how many of them can sign? The form is:")
+    print("    3v2 = any 2 of the 3 members; 5v3 = 3 of the 5")
+    print("    A single number (e.g. 4) is the member count, and the threshold takes its default")
     raw = input("  > ").strip().lower()
     if not raw:
         return 0
-    for sep in ("of", "v", "/", "-", ",", ",", " "):
+    for sep in ("of", "v", "/", "-", ",", "\uff0c", " "):
         raw = raw.replace(sep, " ")
     numbers = [int(part) for part in raw.split() if part.isdigit()]
     if not numbers:
-        print("Couldn't parse that, back to the main menu.")
+        print("  That is not understood, returning to the main menu.")
         return 0
     total = numbers[0]
     threshold = numbers[1] if len(numbers) >= 2 else default_threshold(total)
-    if threshold > total:              # If the order is reversed, it will be automatically reversed.
+    if threshold > total:              # the order was reversed, so swap it automatically
         total, threshold = threshold, total
     if not (1 <= total <= 20 and 1 <= threshold <= total):
-        print("The number of people is limited to 1-20, and the threshold must be 1-%d." % total)
+        print("  The member count is limited to 1-20, and the threshold must be between 1 and %d." % total)
         return 0
     members = random_members(total)
     print()
     print(render_members(members))
-    print("Warning: " + WARNING_TEXT)
-    print("Tip: If you want to do multi-party multi-signature, each participant should keep their own private key.")
-    print("Only send the \"public key\" above to others, and then use menu 2 to build the combined address.")
+    print("  Tip: for a real multi-party multisig, let every participant keep their own private key,")
+    print("      exchange only the public keys above, and then use menu 2 to assemble the address.")
     return show_schemes(members, threshold)
 
 
 def menu_inspect():
     print()
-    text = input("Enter the address (press Enter to return):").strip()
+    text = input("  Enter an address (Enter to go back): ").strip()
     if not text:
         return 0
     print()
@@ -3186,10 +3454,6 @@ def menu_selftest():
     register_checks(lambda name, function: collect_check(checks, name, function))
     print()
     print(render_selftest_report("Self-test", checks))
-    failed = [item for item in checks if not item[1]]
-    print()
-    print("Total %d checks, %d failed." % (len(checks), len(failed)) if failed
-          else "Program OK: %d checks, all passed." % len(checks))
     return 0
 
 
@@ -3198,23 +3462,29 @@ MENU_ACTIONS = {
 }
 
 
+def show_banner():
+    print()
+    print(block("Bitcoin multisig address tool V2 - mainnet only", [
+        "  bc1q   m-of-n multisig: any m signatures can spend",
+        "  bc1p   everyone signs: not one of the N may be missing",
+        "  The two mechanisms differ; do not mix them.",
+    ]))
+
+
 def show_menu():
     print()
-    print(MENU_TEXT)
+    column = max(display_width(title) for _key, title, _hint in MENU_ITEMS)
+    for key, title, hint in MENU_ITEMS:
+        print(("  %s  %s" % (key, pad_display(title, column) + "   " + hint)).rstrip())
 
 
 def run_interactive():
     enable_utf8_console()
-    print()
-    print("Bitcoin multisig address tool V2 (mainnet only)")
-    print("  " + "-" * 46)
-    print("bc1q = m-of-n: any m signatures are enough")
-    print("bc1p = n-of-n: every member must sign")
-    print("These mechanisms are different; do not confuse them.")
+    show_banner()
     while True:
         show_menu()
         try:
-            choice = input("Please select (press enter to exit):").strip() or "0"
+            choice = input("  Choose (Enter quits): ").strip() or "0"
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
@@ -3222,54 +3492,57 @@ def run_interactive():
             return 0
         action = MENU_ACTIONS.get(choice)
         if action is None:
-            print("There is no such option.")
+            print("  There is no such option.")
             continue
         try:
             action()
         except (ValueError, OSError) as error:
-            print("\n Error: %s" % error)
-        except KeyboardInterrupt:
-            print("\nCancelled.")
+            print()
+            print("\n".join(paragraph("Something went wrong: " + str(error))))
+        except (EOFError, KeyboardInterrupt):
+            print()
+            print("  Cancelled.")
+            return 0
 
 
 def add_common_arguments(parser):
     parser.add_argument("-f", "--format", default="block", choices=["block", "json"],
-                        help="Output format, default block")
-    parser.add_argument("-o", "--out", default="-", help="Output file, - means print to screen")
+                        help="output format, block by default")
+    parser.add_argument("-o", "--out", default="-", help="output file, - means print to the screen")
     parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Show details like backend, itemized results, and more")
+                        help="show the backend, the per-item results and other details")
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="bitcoin_multisig_v2",
-        description="Bitcoin multisig address generation and verification (mainnet): bc1q m-of-n, bc1p n-of-n")
+        description="Bitcoin multisig address generation and verification (mainnet): m-of-n with bc1q, everyone signing with bc1p")
     subparsers = parser.add_subparsers(dest="command")
 
-    build = subparsers.add_parser("build", help="Generate multi-signature plan based on member list")
-    build.add_argument("members", nargs="?", default="-", help="Member list file, - means reading from standard input")
+    build = subparsers.add_parser("build", help="build a multisig scheme from a member list")
+    build.add_argument("members", nargs="?", default="-", help="member list file, - means read standard input")
     build.add_argument("-t", "--type", default="p2wsh", choices=["p2wsh", "p2tr", "both"],
-                       help="Scheme type, default p2wsh (m-of-n for bc1q)")
-    build.add_argument("-m", "--threshold", type=int, default=None, help="Several signatures are required (for bc1q)")
+                       help="scheme type, p2wsh by default (m-of-n with bc1q)")
+    build.add_argument("-m", "--threshold", type=int, default=None, help="how many signatures are needed (bc1q)")
     build.add_argument("--order", default="bip67", choices=["bip67", "fingerprint"],
-                       help="Public key sorting method, default bip67")
+                       help="public key ordering, bip67 by default")
     build.add_argument("--layout", default="chain", choices=["chain", "tree"],
-                       help="Taproot structure, default chain (can really force everyone to sign)")
-    build.add_argument("-d", "--detail", action="store_true", help="Display complete information such as scripts, control blocks, etc.")
-    build.add_argument("--verify", action="store_true", help="By the way, do end-to-end signature verification")
+                       help="Taproot structure, chain by default (the one that really enforces everyone signing)")
+    build.add_argument("-d", "--detail", action="store_true", help="show the full information: scripts, control blocks and so on")
+    build.add_argument("--verify", action="store_true", help="also run an end-to-end verification")
     add_common_arguments(build)
 
-    keys = subparsers.add_parser("keys", help="Generate random member keys")
-    keys.add_argument("-c", "--count", type=int, default=10, help="Generate several, default 10")
+    keys = subparsers.add_parser("keys", help="randomly generate member keys")
+    keys.add_argument("-c", "--count", type=int, default=10, help="how many to generate, 10 by default")
     add_common_arguments(keys)
 
-    inspect = subparsers.add_parser("inspect", help="Inspect address")
-    inspect.add_argument("address", help="The address to resolve")
+    inspect = subparsers.add_parser("inspect", help="parse an address")
+    inspect.add_argument("address", help="the address to parse")
     add_common_arguments(inspect)
 
-    selftest = subparsers.add_parser("selftest", help="Built-in Self-test")
-    selftest.add_argument("-o", "--out", default="-", help="Output file, - means print to screen")
-    selftest.add_argument("-v", "--verbose", action="store_true", help="Show results item by item")
+    selftest = subparsers.add_parser("selftest", help="the built-in self-test")
+    selftest.add_argument("-o", "--out", default="-", help="output file, - means print to the screen")
+    selftest.add_argument("-v", "--verbose", action="store_true", help="show the results item by item")
     return parser
 
 
